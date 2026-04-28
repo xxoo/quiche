@@ -357,6 +357,9 @@ int quiche_conn_set_session(quiche_conn *conn, const uint8_t *buf, size_t buf_le
 // no timeout.
 int quiche_conn_set_max_idle_timeout(quiche_conn *conn, uint64_t v);
 
+// Configures max pacing rate to be used.
+void quiche_conn_set_max_pacing_rate(quiche_conn *conn, uint64_t v);
+
 typedef struct {
     // The remote address the packet was received from.
     struct sockaddr *from;

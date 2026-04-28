@@ -452,6 +452,17 @@ fn change_idle_timeout(
 }
 
 #[rstest]
+fn change_max_pacing_rate(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    pipe.client.set_max_pacing_rate(123);
+
+    assert_eq!(pipe.client.recovery_config.max_pacing_rate, Some(123));
+}
+
+#[rstest]
 fn handshake(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));

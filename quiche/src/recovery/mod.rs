@@ -305,6 +305,8 @@ pub trait RecoveryOps {
 
     fn update_max_ack_delay(&mut self, max_ack_delay: Duration);
 
+    fn set_max_pacing_rate(&mut self, max_pacing_rate: u64);
+
     #[cfg(feature = "qlog")]
     fn state_str(&self, now: Instant) -> &'static str;
 
@@ -1850,6 +1852,41 @@ mod tests {
         let double_time_thresh_overhead =
             1.0 + 2.0 * INITIAL_TIME_THRESHOLD_OVERHEAD;
         assert_eq!(r.time_thresh(), double_time_thresh_overhead);
+    }
+
+    #[rstest]
+    fn max_pacing_rate_can_be_updated_after_recovery_creation(
+        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    ) {
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+
+        let mut r = Recovery::new(&cfg);
+        r.set_max_pacing_rate(0);
+
+        assert_eq!(r.pacing_rate(), 0);
+
+        r.set_max_pacing_rate(2);
+
+        if cc_algorithm_name == "bbr2_gcongestion" {
+            assert_ne!(r.pacing_rate(), 0);
+        } else {
+            assert_eq!(r.pacing_rate(), 0);
+        }
+    }
+
+    #[test]
+    fn max_pacing_rate_update_respects_disabled_pacing() {
+        let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        assert_eq!(cfg.set_cc_algorithm_name("bbr2_gcongestion"), Ok(()));
+        cfg.enable_pacing(false);
+
+        let mut r = Recovery::new(&cfg);
+        let initial_pacing_rate = r.pacing_rate();
+
+        r.set_max_pacing_rate(0);
+
+        assert_eq!(r.pacing_rate(), initial_pacing_rate);
     }
 
     #[rstest]

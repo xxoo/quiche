@@ -813,6 +813,11 @@ pub extern "C" fn quiche_conn_set_max_idle_timeout(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn quiche_conn_set_max_pacing_rate(conn: &mut Connection, v: u64) {
+    conn.set_max_pacing_rate(v);
+}
+
 #[repr(C)]
 pub struct RecvInfo<'a> {
     from: &'a sockaddr,

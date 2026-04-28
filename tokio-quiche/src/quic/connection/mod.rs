@@ -779,6 +779,13 @@ pub enum QuicCommand {
 }
 
 impl QuicCommand {
+    /// Creates a command that sets the max value for pacing rate.
+    pub fn set_max_pacing_rate(max_pacing_rate: u64) -> Self {
+        Self::Custom(Box::new(move |qconn| {
+            qconn.set_max_pacing_rate(max_pacing_rate);
+        }))
+    }
+
     /// Consume the command and perform its operation on `qconn`.
     ///
     /// This method should be called by [`ApplicationOverQuic`] implementations
