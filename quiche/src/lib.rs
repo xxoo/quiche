@@ -5610,6 +5610,22 @@ impl<F: BufFactory> Connection<F> {
         self.recovery_config.pacing
     }
 
+    /// Sets the max value for pacing rate.
+    ///
+    /// This updates all existing paths on the connection. Paths created after
+    /// this call will use the updated value.
+    ///
+    /// See [`Config::set_max_pacing_rate()`].
+    ///
+    /// [`Config::set_max_pacing_rate()`]: struct.Config.html#method.set_max_pacing_rate
+    pub fn set_max_pacing_rate(&mut self, v: u64) {
+        self.recovery_config.max_pacing_rate = Some(v);
+
+        for (_, path) in self.paths.iter_mut() {
+            path.recovery.set_max_pacing_rate(v);
+        }
+    }
+
     /// Returns the size of the send quantum, in bytes.
     ///
     /// This represents the maximum size of a packet burst as determined by the

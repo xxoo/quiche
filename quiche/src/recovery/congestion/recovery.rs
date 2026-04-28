@@ -986,6 +986,8 @@ impl RecoveryOps for LegacyRecovery {
         self.rtt_stats.max_ack_delay = max_ack_delay;
     }
 
+    fn set_max_pacing_rate(&mut self, _max_pacing_rate: u64) {}
+
     #[cfg(feature = "qlog")]
     fn state_str(&self, now: Instant) -> &'static str {
         (self.congestion.cc_ops.state_str)(&self.congestion, now)

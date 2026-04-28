@@ -1126,6 +1126,13 @@ impl RecoveryOps for GRecovery {
         self.rtt_stats.max_ack_delay = max_ack_delay;
     }
 
+    fn set_max_pacing_rate(&mut self, max_pacing_rate: u64) {
+        self.pacer.set_max_pacing_rate(
+            Bandwidth::from_mbits_per_second(max_pacing_rate),
+            &self.rtt_stats,
+        );
+    }
+
     fn get_next_release_time(&self) -> ReleaseDecision {
         self.pacer.get_next_release_time()
     }

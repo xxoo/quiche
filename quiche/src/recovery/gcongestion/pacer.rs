@@ -222,13 +222,8 @@ impl Pacer {
             self.burst_tokens = 0;
         }
 
-        if let Some(max_pacing_rate) = self.max_pacing_rate {
-            if rtt_updated {
-                let max_rate = max_pacing_rate * 1.25f32;
-                let max_cwnd =
-                    max_rate.to_bytes_per_period(rtt_stats.smoothed_rtt);
-                self.sender.limit_cwnd(max_cwnd as usize);
-            }
+        if rtt_updated {
+            self.apply_max_pacing_rate_to_cwnd(rtt_stats);
         }
     }
 
@@ -238,6 +233,25 @@ impl Pacer {
 
     pub fn on_retransmission_timeout(&mut self, packets_retransmitted: bool) {
         self.sender.on_retransmission_timeout(packets_retransmitted)
+    }
+
+    pub fn set_max_pacing_rate(
+        &mut self, max_pacing_rate: Bandwidth, rtt_stats: &RttStats,
+    ) {
+        self.max_pacing_rate = Some(max_pacing_rate);
+        self.apply_max_pacing_rate_to_cwnd(rtt_stats);
+    }
+
+    fn apply_max_pacing_rate_to_cwnd(&mut self, rtt_stats: &RttStats) {
+        if !self.enabled {
+            return;
+        }
+
+        if let Some(max_pacing_rate) = self.max_pacing_rate {
+            let max_rate = max_pacing_rate * 1.25f32;
+            let max_cwnd = max_rate.to_bytes_per_period(rtt_stats.smoothed_rtt);
+            self.sender.limit_cwnd(max_cwnd as usize);
+        }
     }
 
     pub fn pacing_rate(
