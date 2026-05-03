@@ -61,8 +61,9 @@ pub struct QuicSettings {
     #[serde(default = "QuicSettings::default_dgram_max_queue_len")]
     pub dgram_send_max_queue_len: usize,
 
-    /// Configures whether to enable early data (0-RTT) support. Currently only
-    /// supported for servers.
+    /// Configures whether to enable early data (0-RTT) support.
+    ///
+    /// Clients also need a resumption session to send early data.
     ///
     /// Defaults to `false`.
     pub enable_early_data: bool,

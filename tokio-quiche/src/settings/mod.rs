@@ -55,6 +55,14 @@ pub struct ConnectionParams<'a> {
     pub hooks: Hooks,
     /// Set the session to attempt resumption.
     pub session: Option<Vec<u8>>,
+    /// Raw QUIC DATAGRAM payloads to send as 0-RTT data on client connections.
+    ///
+    /// These payloads are sent before [`connect_with_config()`] returns, but
+    /// the function still only resolves after the QUIC handshake has
+    /// completed. A resumption session and early data support are required.
+    ///
+    /// [`connect_with_config()`]: crate::quic::connect_with_config
+    pub zero_rtt_dgrams: Vec<Vec<u8>>,
     /// Custom destination connection ID to use for client connections.
     ///
     /// Be aware that [RFC 9000] places requirements for unpredictability and
@@ -95,6 +103,7 @@ impl<'a> ConnectionParams<'a> {
             tls_cert: Some(tls_cert),
             hooks,
             session: None,
+            zero_rtt_dgrams: Vec::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }
@@ -112,6 +121,7 @@ impl<'a> ConnectionParams<'a> {
             tls_cert,
             hooks,
             session: None,
+            zero_rtt_dgrams: Vec::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }

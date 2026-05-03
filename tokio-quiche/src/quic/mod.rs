@@ -184,6 +184,16 @@ where
     Rx: DatagramSocketRecv + Unpin + 'static,
     App: ApplicationOverQuic,
 {
+    if !params.zero_rtt_dgrams.is_empty() {
+        if params.session.is_none() {
+            return Err("0-RTT DATAGRAMs require a resumption session".into());
+        }
+
+        if !params.settings.enable_early_data {
+            return Err("0-RTT DATAGRAMs require early data to be enabled".into());
+        }
+    }
+
     let mut client_config = Config::new(params, socket.capabilities)?;
     let scid = SimpleConnectionIdGenerator.new_connection_id();
 
@@ -262,7 +272,11 @@ where
         Arc::clone(&socket_tx),
         socket_rx,
         socket.local_addr,
-        ClientConnector::new(socket_tx, quiche_conn),
+        ClientConnector::new(
+            socket_tx,
+            quiche_conn,
+            params.zero_rtt_dgrams.clone(),
+        ),
         DefaultMetrics,
     );
 

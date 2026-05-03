@@ -53,6 +53,7 @@ pub(crate) struct ClientConnector<Tx> {
     socket_tx: MaybeConnectedSocket<Arc<Tx>>,
     connection: ConnectionState,
     timeout_queue: DelayQueue<ConnectionId<'static>>,
+    zero_rtt_dgrams: Vec<Vec<u8>>,
 }
 
 /// State the connecting connection is in.
@@ -103,12 +104,37 @@ impl<Tx> ClientConnector<Tx>
 where
     Tx: DatagramSocketSend + Send + 'static,
 {
-    pub(crate) fn new(socket_tx: Arc<Tx>, connection: QuicheConnection) -> Self {
+    pub(crate) fn new(
+        socket_tx: Arc<Tx>, connection: QuicheConnection,
+        zero_rtt_dgrams: Vec<Vec<u8>>,
+    ) -> Self {
         Self {
             socket_tx: MaybeConnectedSocket::new(socket_tx),
             connection: ConnectionState::Queued(connection),
             timeout_queue: Default::default(),
+            zero_rtt_dgrams,
         }
+    }
+
+    fn send_zero_rtt_dgrams(
+        &mut self, conn: &mut QuicheConnection,
+    ) -> io::Result<()> {
+        if self.zero_rtt_dgrams.is_empty() {
+            return Ok(());
+        }
+
+        if !conn.is_in_early_data() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "0-RTT DATAGRAMs configured, but early data is unavailable",
+            ));
+        }
+
+        for dgram in self.zero_rtt_dgrams.drain(..) {
+            conn.dgram_send(&dgram).map_err(io::Error::other)?;
+        }
+
+        simple_conn_send(&self.socket_tx, conn)
     }
 
     /// Sets the connection to it's pending state. Await [`Incoming`] packets.
@@ -118,6 +144,7 @@ where
         &mut self, mut conn: QuicheConnection,
     ) -> io::Result<()> {
         simple_conn_send(&self.socket_tx, &mut conn)?;
+        self.send_zero_rtt_dgrams(&mut conn)?;
 
         let timeout_key = conn.timeout_instant().map(|instant| {
             self.timeout_queue
