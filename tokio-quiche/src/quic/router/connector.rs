@@ -26,6 +26,7 @@
 
 use std::io;
 use std::mem;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
@@ -116,7 +117,7 @@ where
         }
     }
 
-    fn send_zero_rtt_dgrams(
+    fn queue_zero_rtt_dgrams(
         &mut self, conn: &mut QuicheConnection,
     ) -> io::Result<()> {
         if self.zero_rtt_dgrams.is_empty() {
@@ -134,7 +135,7 @@ where
             conn.dgram_send(&dgram).map_err(io::Error::other)?;
         }
 
-        simple_conn_send(&self.socket_tx, conn)
+        Ok(())
     }
 
     /// Sets the connection to it's pending state. Await [`Incoming`] packets.
@@ -143,8 +144,16 @@ where
     fn set_connection_to_pending(
         &mut self, mut conn: QuicheConnection,
     ) -> io::Result<()> {
-        simple_conn_send(&self.socket_tx, &mut conn)?;
-        self.send_zero_rtt_dgrams(&mut conn)?;
+        let mut packets = drain_conn_send(&mut conn)?;
+        self.queue_zero_rtt_dgrams(&mut conn)?;
+        packets.extend(drain_conn_send(&mut conn)?);
+        // Send Initial and 0-RTT packets from one task so early-data packets
+        // cannot race ahead of the Initial that creates the server route.
+        spawn_packet_send(
+            &self.socket_tx,
+            conn.source_id().into_owned(),
+            packets,
+        );
 
         let timeout_key = conn.timeout_instant().map(|instant| {
             self.timeout_queue
@@ -287,34 +296,45 @@ where
 /// This does not have to be efficent, since once a connection is established
 /// the [`crate::quic::io::worker::IoWorker`] will take over sending and
 /// receiving.
-fn simple_conn_send<Tx: DatagramSocketSend + Send + Sync + 'static>(
-    socket_tx: &MaybeConnectedSocket<Arc<Tx>>, conn: &mut QuicheConnection,
-) -> io::Result<()> {
+fn drain_conn_send(
+    conn: &mut QuicheConnection,
+) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
     let scid = conn.source_id().into_owned();
-    log::debug!("sending client Initials to peer"; "scid" => ?scid);
+    log::debug!("sending client handshake packets to peer"; "scid" => ?scid);
+    let mut packets = Vec::new();
 
     loop {
-        let scid = scid.clone();
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let send_res = conn.send(&mut buf);
 
-        let socket_clone = socket_tx.clone();
         match send_res {
             Ok((n, send_info)) => {
-                tokio::spawn({
-                    let buf = buf[0..n].to_vec();
-                    async move {
-                        socket_clone.send_to(&buf, send_info.to).await.inspect_err(|error| {
-                        log::error!("error sending client Initial packets to peer"; "scid" => ?scid, "peer_addr" => send_info.to, "error" => error.to_string());
-                    })
-                    }
-                });
+                packets.push((buf[0..n].to_vec(), send_info.to));
             },
-            Err(quiche::Error::Done) => break Ok(()),
+            Err(quiche::Error::Done) => break Ok(packets),
             Err(error) => {
                 log::error!("error writing packets to quiche's internal buffer"; "scid" => ?scid, "error" => error.to_string());
                 break Err(std::io::Error::other(error));
             },
         }
     }
+}
+
+fn spawn_packet_send<Tx: DatagramSocketSend + Send + Sync + 'static>(
+    socket_tx: &MaybeConnectedSocket<Arc<Tx>>, scid: ConnectionId<'static>,
+    packets: Vec<(Vec<u8>, SocketAddr)>,
+) {
+    if packets.is_empty() {
+        return;
+    }
+
+    let socket_clone = socket_tx.clone();
+
+    tokio::spawn(async move {
+        for (buf, to) in packets {
+            let _ = socket_clone.send_to(&buf, to).await.inspect_err(|error| {
+                log::error!("error sending client handshake packets to peer"; "scid" => ?scid, "peer_addr" => to, "error" => error.to_string());
+            });
+        }
+    });
 }
