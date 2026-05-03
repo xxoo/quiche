@@ -29,6 +29,8 @@ use serde_with::serde_as;
 use serde_with::DurationMilliSeconds;
 use std::time::Duration;
 
+use super::PeerTrustRoots;
+
 pub use qlog::writer::QlogCompression;
 
 /// QUIC configuration parameters.
@@ -258,6 +260,15 @@ pub struct QuicSettings {
     /// [`verify_peer()`]: https://docs.rs/quiche/latest/quiche/struct.Config.html#method.verify_peer
     pub verify_peer: bool,
 
+    /// Optional trust roots to use when verifying the peer certificate.
+    ///
+    /// When unset, peer verification uses the TLS backend's default roots. This
+    /// setting has no effect unless [`verify_peer`] is enabled.
+    ///
+    /// [`verify_peer`]: Self::verify_peer
+    #[serde(default)]
+    pub peer_trust_roots: Option<PeerTrustRoots>,
+
     /// The maximum size of the receiver connection flow control window.
     ///
     /// Defaults to 24MB.
@@ -485,6 +496,8 @@ impl QuicSettings {
 
 #[cfg(test)]
 mod test {
+    use super::super::CustomFileTrustRoots;
+    use super::PeerTrustRoots;
     use super::QuicSettings;
     use std::time::Duration;
 
@@ -497,5 +510,29 @@ mod test {
 
         assert_eq!(quic.handshake_timeout.unwrap(), Duration::from_secs(5));
         assert_eq!(quic.max_idle_timeout.unwrap(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn peer_trust_roots_parse_custom_file() {
+        let quic = serde_json::from_str::<QuicSettings>(
+            r#"{
+                "verify_peer": true,
+                "peer_trust_roots": {
+                    "custom_file": {
+                        "path": "/tmp/rootca.pem",
+                        "include_system_roots": false
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            quic.peer_trust_roots,
+            Some(PeerTrustRoots::CustomFile(CustomFileTrustRoots {
+                path: "/tmp/rootca.pem".to_string(),
+                include_system_roots: false,
+            }))
+        );
     }
 }

@@ -34,6 +34,7 @@ use qlog::writer::QlogCompression;
 use crate::result::QuicResult;
 use crate::settings::CertificateKind;
 use crate::settings::ConnectionParams;
+use crate::settings::PeerTrustRoots;
 use crate::settings::TlsCertificatePaths;
 use crate::socket::SocketCapabilities;
 
@@ -115,6 +116,8 @@ impl Config {
 fn make_quiche_config(
     params: &ConnectionParams, should_log_keys: bool,
 ) -> QuicResult<quiche::Config> {
+    let quic_settings = &params.settings;
+    let peer_trust_roots = quic_settings.peer_trust_roots.as_ref();
     let ssl_ctx_builder = params
         .hooks
         .connection_hook
@@ -122,16 +125,25 @@ fn make_quiche_config(
         .zip(params.tls_cert)
         .and_then(|(hook, tls)| hook.create_custom_ssl_context_builder(tls));
 
-    let mut config = if let Some(builder) = ssl_ctx_builder {
+    let mut peer_trust_roots_applied = false;
+    let mut config = if let Some(mut builder) = ssl_ctx_builder {
+        apply_peer_trust_roots_to_ssl_builder(&mut builder, peer_trust_roots)?;
+        peer_trust_roots_applied = peer_trust_roots.is_some();
+
         quiche::Config::with_boring_ssl_ctx_builder(
             quiche::PROTOCOL_VERSION,
             builder,
         )?
     } else {
-        quiche_config_with_tls(params.tls_cert)?
+        quiche_config_with_tls(
+            params.tls_cert,
+            should_load_system_trust_roots(peer_trust_roots),
+        )?
     };
 
-    let quic_settings = &params.settings;
+    if !peer_trust_roots_applied {
+        apply_peer_trust_roots_to_quiche_config(&mut config, peer_trust_roots)?;
+    }
 
     let alpns: Vec<&[u8]> =
         quic_settings.alpn.iter().map(Vec::as_slice).collect();
@@ -226,10 +238,10 @@ fn make_quiche_config(
 }
 
 fn quiche_config_with_tls(
-    tls_cert: Option<TlsCertificatePaths>,
+    tls_cert: Option<TlsCertificatePaths>, load_system_trust_roots: bool,
 ) -> QuicResult<quiche::Config> {
     let Some(tls) = tls_cert else {
-        return Ok(quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap());
+        return quiche_config(load_system_trust_roots);
     };
 
     match tls.kind {
@@ -255,13 +267,69 @@ fn quiche_config_with_tls(
             )?)
         },
         CertificateKind::X509 => {
-            let mut config =
-                quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            let mut config = quiche_config(load_system_trust_roots)?;
             config.load_cert_chain_from_pem_file(tls.cert)?;
             config.load_priv_key_from_pem_file(tls.private_key)?;
             Ok(config)
         },
     }
+}
+
+fn quiche_config(load_system_trust_roots: bool) -> QuicResult<quiche::Config> {
+    if load_system_trust_roots {
+        return Ok(quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap());
+    }
+
+    let builder =
+        boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())?;
+
+    Ok(quiche::Config::with_boring_ssl_ctx_builder(
+        quiche::PROTOCOL_VERSION,
+        builder,
+    )?)
+}
+
+fn should_load_system_trust_roots(
+    peer_trust_roots: Option<&PeerTrustRoots>,
+) -> bool {
+    !matches!(
+        peer_trust_roots,
+        Some(PeerTrustRoots::CustomFile(roots))
+            if !roots.include_system_roots
+    )
+}
+
+fn apply_peer_trust_roots_to_quiche_config(
+    config: &mut quiche::Config, peer_trust_roots: Option<&PeerTrustRoots>,
+) -> QuicResult<()> {
+    if let Some(PeerTrustRoots::CustomFile(roots)) = peer_trust_roots {
+        config.load_verify_locations_from_file(&roots.path)?;
+    }
+
+    Ok(())
+}
+
+fn apply_peer_trust_roots_to_ssl_builder(
+    builder: &mut boring::ssl::SslContextBuilder,
+    peer_trust_roots: Option<&PeerTrustRoots>,
+) -> QuicResult<()> {
+    match peer_trust_roots {
+        None => {},
+
+        Some(PeerTrustRoots::System) => {
+            builder.set_default_verify_paths()?;
+        },
+
+        Some(PeerTrustRoots::CustomFile(roots)) => {
+            if roots.include_system_roots {
+                builder.set_default_verify_paths()?;
+            }
+
+            builder.set_ca_file(&roots.path)?;
+        },
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "rpk")]
