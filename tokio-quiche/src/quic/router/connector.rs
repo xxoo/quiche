@@ -46,6 +46,8 @@ use crate::quic::router::InitialPacketHandler;
 use crate::quic::router::NewConnection;
 use crate::quic::Incoming;
 use crate::quic::QuicheConnection;
+use crate::settings::ConnectionParams;
+use crate::settings::ZeroRttStream;
 
 /// A [`ClientConnector`] manages client-initiated [`quiche::Connection`]s. When
 /// a connection is established, this struct returns the connection to the
@@ -55,6 +57,7 @@ pub(crate) struct ClientConnector<Tx> {
     connection: ConnectionState,
     timeout_queue: DelayQueue<ConnectionId<'static>>,
     zero_rtt_dgrams: Vec<Vec<u8>>,
+    zero_rtt_streams: Vec<ZeroRttStream>,
 }
 
 /// State the connecting connection is in.
@@ -107,13 +110,14 @@ where
 {
     pub(crate) fn new(
         socket_tx: Arc<Tx>, connection: QuicheConnection,
-        zero_rtt_dgrams: Vec<Vec<u8>>,
+        zero_rtt_dgrams: Vec<Vec<u8>>, zero_rtt_streams: Vec<ZeroRttStream>,
     ) -> Self {
         Self {
             socket_tx: MaybeConnectedSocket::new(socket_tx),
             connection: ConnectionState::Queued(connection),
             timeout_queue: Default::default(),
             zero_rtt_dgrams,
+            zero_rtt_streams,
         }
     }
 
@@ -138,6 +142,44 @@ where
         Ok(())
     }
 
+    fn queue_zero_rtt_streams(
+        &mut self, conn: &mut QuicheConnection,
+    ) -> io::Result<()> {
+        if self.zero_rtt_streams.is_empty() {
+            return Ok(());
+        }
+
+        if !conn.is_in_early_data() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "0-RTT STREAMs configured, but early data is unavailable",
+            ));
+        }
+
+        for (idx, stream) in self.zero_rtt_streams.drain(..).enumerate() {
+            let stream_id = ConnectionParams::zero_rtt_stream_id(idx)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "too many 0-RTT STREAMs configured",
+                    )
+                })?;
+
+            let sent = conn
+                .stream_send(stream_id, &stream.data, stream.fin)
+                .map_err(io::Error::other)?;
+
+            if sent != stream.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "0-RTT STREAM payload exceeds send capacity",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Sets the connection to it's pending state. Await [`Incoming`] packets.
     ///
     /// This sends any pending packets and arms the connection's timeout timer.
@@ -146,6 +188,7 @@ where
     ) -> io::Result<()> {
         let mut packets = drain_conn_send(&mut conn)?;
         self.queue_zero_rtt_dgrams(&mut conn)?;
+        self.queue_zero_rtt_streams(&mut conn)?;
         packets.extend(drain_conn_send(&mut conn)?);
         // Send Initial and 0-RTT packets from one task so early-data packets
         // cannot race ahead of the Initial that creates the server route.

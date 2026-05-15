@@ -146,6 +146,7 @@ pub use crate::quic::connection::QuicConnection;
 pub use crate::result::BoxError;
 pub use crate::result::QuicResult;
 pub use crate::settings::ConnectionParams;
+pub use crate::settings::ZeroRttStream;
 
 #[doc(hidden)]
 pub use crate::result::QuicResultExt;
