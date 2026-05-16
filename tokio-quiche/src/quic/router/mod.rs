@@ -845,21 +845,29 @@ mod tests {
 
     use crate::http3::settings::Http3Settings;
     use crate::metrics::DefaultMetrics;
+    use crate::quic::connection::ApplicationOverQuic;
     use crate::quic::connection::SimpleConnectionIdGenerator;
+    use crate::quic::QuicheConnection;
     use crate::settings::Config;
     use crate::settings::Hooks;
     use crate::settings::QuicSettings;
     use crate::settings::TlsCertificatePaths;
+    use crate::settings::ZeroRttStream;
+    use crate::socket::Socket;
     use crate::socket::SocketCapabilities;
     use crate::ConnectionParams;
+    use crate::QuicResult;
     use crate::ServerH3Driver;
 
     use datagram_socket::MAX_DATAGRAM_SIZE;
     use h3i::actions::h3::Action;
+    use std::future;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UdpSocket;
+    use tokio::sync::oneshot;
     use tokio::time;
+    use tokio_stream::StreamExt;
 
     const TEST_CERT_FILE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -871,6 +879,200 @@ mod tests {
         "/",
         "../quiche/examples/cert.key"
     );
+
+    type StreamEvent = (bool, u64, Vec<u8>, bool);
+
+    struct TestApp {
+        session_tx: Option<oneshot::Sender<Option<Vec<u8>>>>,
+        dgram_tx: Option<oneshot::Sender<(bool, Vec<u8>)>>,
+        stream_tx: Option<oneshot::Sender<StreamEvent>>,
+        stream_response: Option<Vec<u8>>,
+        close_on_stream: bool,
+        buf: Vec<u8>,
+    }
+
+    impl TestApp {
+        fn new(
+            session_tx: Option<oneshot::Sender<Option<Vec<u8>>>>,
+            dgram_tx: Option<oneshot::Sender<(bool, Vec<u8>)>>,
+        ) -> Self {
+            Self {
+                session_tx,
+                dgram_tx,
+                stream_tx: None,
+                stream_response: None,
+                close_on_stream: false,
+                buf: vec![0; MAX_DATAGRAM_SIZE],
+            }
+        }
+
+        fn new_stream(
+            stream_tx: oneshot::Sender<StreamEvent>,
+            stream_response: Option<Vec<u8>>, close_on_stream: bool,
+        ) -> Self {
+            Self {
+                session_tx: None,
+                dgram_tx: None,
+                stream_tx: Some(stream_tx),
+                stream_response,
+                close_on_stream,
+                buf: vec![0; MAX_DATAGRAM_SIZE],
+            }
+        }
+
+        fn maybe_send_session(&mut self, qconn: &mut QuicheConnection) {
+            let Some(session_tx) = self.session_tx.take() else {
+                return;
+            };
+
+            let Some(session) = qconn.session().map(<[u8]>::to_vec) else {
+                self.session_tx = Some(session_tx);
+                return;
+            };
+
+            let _ = session_tx.send(Some(session));
+        }
+
+        fn process_streams(
+            &mut self, qconn: &mut QuicheConnection,
+        ) -> QuicResult<()> {
+            let mut stream_tx = self.stream_tx.take();
+
+            for stream_id in qconn.readable() {
+                let mut data = Vec::new();
+                let mut fin = false;
+
+                loop {
+                    match qconn.stream_recv(stream_id, &mut self.buf) {
+                        Ok((len, stream_fin)) => {
+                            data.extend_from_slice(&self.buf[..len]);
+                            fin |= stream_fin;
+
+                            if stream_fin {
+                                break;
+                            }
+                        },
+
+                        Err(quiche::Error::Done) => break,
+
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                if data.is_empty() && !fin {
+                    continue;
+                }
+
+                if let Some(response) = self.stream_response.take() {
+                    qconn.stream_send(stream_id, &response, true)?;
+                }
+
+                if let Some(tx) = stream_tx.take() {
+                    let _ =
+                        tx.send((qconn.is_in_early_data(), stream_id, data, fin));
+                }
+
+                if self.close_on_stream {
+                    let _ = qconn.close(
+                        false,
+                        quiche::WireErrorCode::NoError as u64,
+                        &[],
+                    );
+                }
+            }
+
+            self.stream_tx = stream_tx;
+
+            Ok(())
+        }
+    }
+
+    impl ApplicationOverQuic for TestApp {
+        fn on_conn_established(
+            &mut self, qconn: &mut QuicheConnection,
+            _handshake_info: &HandshakeInfo,
+        ) -> QuicResult<()> {
+            self.maybe_send_session(qconn);
+            Ok(())
+        }
+
+        fn should_act(&self) -> bool {
+            true
+        }
+
+        fn buffer(&mut self) -> &mut [u8] {
+            &mut self.buf
+        }
+
+        fn wait_for_data(
+            &mut self, _qconn: &mut QuicheConnection,
+        ) -> impl Future<Output = QuicResult<()>> + Send {
+            future::pending()
+        }
+
+        fn process_reads(
+            &mut self, qconn: &mut QuicheConnection,
+        ) -> QuicResult<()> {
+            self.maybe_send_session(qconn);
+
+            loop {
+                match qconn.dgram_recv(&mut self.buf) {
+                    Ok(len) =>
+                        if let Some(dgram_tx) = self.dgram_tx.take() {
+                            let dgram = self.buf[..len].to_vec();
+                            let _ =
+                                dgram_tx.send((qconn.is_in_early_data(), dgram));
+                            let _ = qconn.close(
+                                false,
+                                quiche::WireErrorCode::NoError as u64,
+                                &[],
+                            );
+                        },
+
+                    Err(quiche::Error::Done) => break,
+
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            self.process_streams(qconn)
+        }
+
+        fn process_writes(
+            &mut self, qconn: &mut QuicheConnection,
+        ) -> QuicResult<()> {
+            self.maybe_send_session(qconn);
+            Ok(())
+        }
+    }
+
+    fn test_quic_settings() -> QuicSettings {
+        QuicSettings {
+            enable_early_data: true,
+            disable_client_ip_validation: true,
+            max_idle_timeout: Some(Duration::from_secs(5)),
+            max_recv_udp_payload_size: MAX_DATAGRAM_SIZE,
+            max_send_udp_payload_size: MAX_DATAGRAM_SIZE,
+            verify_peer: false,
+            ..Default::default()
+        }
+    }
+
+    async fn connect_test_client(
+        server_addr: std::net::SocketAddr, params: &ConnectionParams<'_>,
+        app: TestApp,
+    ) -> QuicResult<crate::QuicConnection> {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(server_addr).await?;
+
+        crate::quic::connect_with_config(
+            Socket::try_from(socket)?,
+            Some("test.com"),
+            params,
+            app,
+        )
+        .await
+    }
 
     fn test_connect(host_port: String) {
         let h3i_config = h3i::config::Config::new()
@@ -967,5 +1169,279 @@ mod tests {
         // NOTE: this is a smoke test - in case of issues `notified()` future will
         // never resolve hanging the test.
         drop_check.closed().await;
+    }
+
+    #[tokio::test]
+    async fn zero_rtt_dgram_reaches_server() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let server_params = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let mut streams =
+            crate::listen([server_socket], server_params, DefaultMetrics)
+                .unwrap();
+        let mut incoming = streams.pop().unwrap();
+        let (dgram_tx, dgram_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut dgram_tx = Some(dgram_tx);
+
+            for i in 0..2 {
+                let conn = incoming.next().await.unwrap().unwrap();
+                let dgram_tx = if i == 1 { dgram_tx.take() } else { None };
+                conn.start(TestApp::new(None, dgram_tx));
+            }
+        });
+
+        let (session_tx, session_rx) = oneshot::channel();
+        let first_client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        let _first_conn = connect_test_client(
+            server_addr,
+            &first_client_params,
+            TestApp::new(Some(session_tx), None),
+        )
+        .await
+        .unwrap();
+
+        let session = time::timeout(Duration::from_secs(5), session_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("client session should be available after handshake");
+
+        let payload = b"zero-rtt-auth".to_vec();
+        let mut second_client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        second_client_params.session = Some(session);
+        second_client_params.zero_rtt_dgrams = vec![payload.clone()];
+
+        let _second_conn = connect_test_client(
+            server_addr,
+            &second_client_params,
+            TestApp::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        let (is_early_data, received) =
+            time::timeout(Duration::from_secs(5), dgram_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert!(is_early_data);
+        assert_eq!(received, payload);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn zero_rtt_stream_reaches_server_and_client_receives_response() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let server_params = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let mut streams =
+            crate::listen([server_socket], server_params, DefaultMetrics)
+                .unwrap();
+        let mut incoming = streams.pop().unwrap();
+        let (server_stream_tx, server_stream_rx) = oneshot::channel();
+        let server_response = b"auth-ok".to_vec();
+        let server_task = tokio::spawn(async move {
+            let mut server_stream_tx = Some(server_stream_tx);
+
+            for i in 0..2 {
+                let conn = incoming.next().await.unwrap().unwrap();
+                let app = if i == 1 {
+                    TestApp::new_stream(
+                        server_stream_tx.take().unwrap(),
+                        Some(server_response.clone()),
+                        false,
+                    )
+                } else {
+                    TestApp::new(None, None)
+                };
+                conn.start(app);
+            }
+        });
+
+        let (session_tx, session_rx) = oneshot::channel();
+        let first_client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        let _first_conn = connect_test_client(
+            server_addr,
+            &first_client_params,
+            TestApp::new(Some(session_tx), None),
+        )
+        .await
+        .unwrap();
+
+        let session = time::timeout(Duration::from_secs(5), session_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("client session should be available after handshake");
+
+        let stream_id = ConnectionParams::zero_rtt_stream_id(0).unwrap();
+        let payload = b"zero-rtt-stream-auth".to_vec();
+        let mut second_client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        second_client_params.session = Some(session);
+        second_client_params.zero_rtt_streams = vec![ZeroRttStream {
+            data: payload.clone(),
+            fin: true,
+        }];
+
+        let (client_stream_tx, client_stream_rx) = oneshot::channel();
+        let _second_conn = connect_test_client(
+            server_addr,
+            &second_client_params,
+            TestApp::new_stream(client_stream_tx, None, true),
+        )
+        .await
+        .unwrap();
+
+        let (server_early_data, server_stream_id, server_received, server_fin) =
+            time::timeout(Duration::from_secs(5), server_stream_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert!(server_early_data);
+        assert_eq!(server_stream_id, stream_id);
+        assert_eq!(server_received, payload);
+        assert!(server_fin);
+
+        let (_, client_stream_id, client_received, client_fin) =
+            time::timeout(Duration::from_secs(5), client_stream_rx)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(client_stream_id, stream_id);
+        assert_eq!(client_received, b"auth-ok");
+        assert!(client_fin);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn zero_rtt_stream_count_is_validated_before_sending() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let mut server_settings = test_quic_settings();
+        server_settings.initial_max_streams_bidi = 1;
+        let server_params = ConnectionParams::new_server(
+            server_settings,
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let mut streams =
+            crate::listen([server_socket], server_params, DefaultMetrics)
+                .unwrap();
+        let mut incoming = streams.pop().unwrap();
+        let (second_accept_tx, second_accept_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut second_accept_tx = Some(second_accept_tx);
+
+            for i in 0..2 {
+                let conn = incoming.next().await.unwrap().unwrap();
+                if i == 1 {
+                    let _ = second_accept_tx.take().unwrap().send(());
+                }
+                conn.start(TestApp::new(None, None));
+            }
+        });
+
+        let (session_tx, session_rx) = oneshot::channel();
+        let first_client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        let _first_conn = connect_test_client(
+            server_addr,
+            &first_client_params,
+            TestApp::new(Some(session_tx), None),
+        )
+        .await
+        .unwrap();
+
+        let session = time::timeout(Duration::from_secs(5), session_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("client session should be available after handshake");
+
+        let mut second_client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        second_client_params.session = Some(session);
+        second_client_params.zero_rtt_streams = vec![
+            ZeroRttStream {
+                data: b"first".to_vec(),
+                fin: true,
+            },
+            ZeroRttStream {
+                data: b"second".to_vec(),
+                fin: true,
+            },
+        ];
+
+        let error = match connect_test_client(
+            server_addr,
+            &second_client_params,
+            TestApp::new(None, None),
+        )
+        .await
+        {
+            Ok(_) => panic!("0-RTT stream count validation should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("0-RTT STREAM count 2"));
+        assert!(time::timeout(Duration::from_millis(200), second_accept_rx)
+            .await
+            .is_err());
+
+        server_task.abort();
     }
 }

@@ -26,6 +26,7 @@
 
 use std::io;
 use std::mem;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
@@ -45,6 +46,8 @@ use crate::quic::router::InitialPacketHandler;
 use crate::quic::router::NewConnection;
 use crate::quic::Incoming;
 use crate::quic::QuicheConnection;
+use crate::settings::ConnectionParams;
+use crate::settings::ZeroRttStream;
 
 /// A [`ClientConnector`] manages client-initiated [`quiche::Connection`]s. When
 /// a connection is established, this struct returns the connection to the
@@ -53,6 +56,8 @@ pub(crate) struct ClientConnector<Tx> {
     socket_tx: MaybeConnectedSocket<Arc<Tx>>,
     connection: ConnectionState,
     timeout_queue: DelayQueue<ConnectionId<'static>>,
+    zero_rtt_dgrams: Vec<Vec<u8>>,
+    zero_rtt_streams: Vec<ZeroRttStream>,
 }
 
 /// State the connecting connection is in.
@@ -81,8 +86,9 @@ impl ConnectionState {
         &mut self, scid: &ConnectionId<'static>,
     ) -> Option<PendingConnection> {
         match mem::replace(self, Self::Returned) {
-            Self::Pending(pending) if *scid == pending.conn.source_id() =>
-                Some(pending),
+            Self::Pending(pending) if *scid == pending.conn.source_id() => {
+                Some(pending)
+            },
             state => {
                 *self = state;
                 None
@@ -105,12 +111,74 @@ where
 {
     pub(crate) fn new(
         socket_tx: Arc<Tx>, connection: Box<QuicheConnection>,
+        zero_rtt_dgrams: Vec<Vec<u8>>, zero_rtt_streams: Vec<ZeroRttStream>,
     ) -> Self {
         Self {
             socket_tx: MaybeConnectedSocket::new(socket_tx),
             connection: ConnectionState::Queued(connection),
             timeout_queue: Default::default(),
+            zero_rtt_dgrams,
+            zero_rtt_streams,
         }
+    }
+
+    fn queue_zero_rtt_dgrams(
+        &mut self, conn: &mut QuicheConnection,
+    ) -> io::Result<()> {
+        if self.zero_rtt_dgrams.is_empty() {
+            return Ok(());
+        }
+
+        if !conn.is_in_early_data() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "0-RTT DATAGRAMs configured, but early data is unavailable",
+            ));
+        }
+
+        for dgram in self.zero_rtt_dgrams.drain(..) {
+            conn.dgram_send(&dgram).map_err(io::Error::other)?;
+        }
+
+        Ok(())
+    }
+
+    fn queue_zero_rtt_streams(
+        &mut self, conn: &mut QuicheConnection,
+    ) -> io::Result<()> {
+        if self.zero_rtt_streams.is_empty() {
+            return Ok(());
+        }
+
+        if !conn.is_in_early_data() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "0-RTT STREAMs configured, but early data is unavailable",
+            ));
+        }
+
+        for (idx, stream) in self.zero_rtt_streams.drain(..).enumerate() {
+            let stream_id = ConnectionParams::zero_rtt_stream_id(idx)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "too many 0-RTT STREAMs configured",
+                    )
+                })?;
+
+            let sent = conn
+                .stream_send(stream_id, &stream.data, stream.fin)
+                .map_err(io::Error::other)?;
+
+            if sent != stream.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "0-RTT STREAM payload exceeds send capacity",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Sets the connection to it's pending state. Await [`Incoming`] packets.
@@ -119,7 +187,17 @@ where
     fn set_connection_to_pending(
         &mut self, mut conn: Box<QuicheConnection>,
     ) -> io::Result<()> {
-        simple_conn_send(&self.socket_tx, &mut conn)?;
+        let mut packets = drain_conn_send(&mut conn)?;
+        self.queue_zero_rtt_dgrams(&mut conn)?;
+        self.queue_zero_rtt_streams(&mut conn)?;
+        packets.extend(drain_conn_send(&mut conn)?);
+        // Send Initial and 0-RTT packets from one task so early-data packets
+        // cannot race ahead of the Initial that creates the server route.
+        spawn_packet_send(
+            &self.socket_tx,
+            conn.source_id().into_owned(),
+            packets,
+        );
 
         let timeout_key = conn.timeout_instant().map(|instant| {
             self.timeout_queue
@@ -262,34 +340,45 @@ where
 /// This does not have to be efficent, since once a connection is established
 /// the [`crate::quic::io::worker::IoWorker`] will take over sending and
 /// receiving.
-fn simple_conn_send<Tx: DatagramSocketSend + Send + Sync + 'static>(
-    socket_tx: &MaybeConnectedSocket<Arc<Tx>>, conn: &mut QuicheConnection,
-) -> io::Result<()> {
+fn drain_conn_send(
+    conn: &mut QuicheConnection,
+) -> io::Result<Vec<(Vec<u8>, SocketAddr)>> {
     let scid = conn.source_id().into_owned();
-    log::debug!("sending client Initials to peer"; "scid" => ?scid);
+    log::debug!("sending client handshake packets to peer"; "scid" => ?scid);
+    let mut packets = Vec::new();
 
     loop {
-        let scid = scid.clone();
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let send_res = conn.send(&mut buf);
 
-        let socket_clone = socket_tx.clone();
         match send_res {
             Ok((n, send_info)) => {
-                tokio::spawn({
-                    let buf = buf[0..n].to_vec();
-                    async move {
-                        socket_clone.send_to(&buf, send_info.to).await.inspect_err(|error| {
-                        log::error!("error sending client Initial packets to peer"; "scid" => ?scid, "peer_addr" => send_info.to, "error" => error.to_string());
-                    })
-                    }
-                });
+                packets.push((buf[0..n].to_vec(), send_info.to));
             },
-            Err(quiche::Error::Done) => break Ok(()),
+            Err(quiche::Error::Done) => break Ok(packets),
             Err(error) => {
                 log::error!("error writing packets to quiche's internal buffer"; "scid" => ?scid, "error" => error.to_string());
                 break Err(std::io::Error::other(error));
             },
         }
     }
+}
+
+fn spawn_packet_send<Tx: DatagramSocketSend + Send + Sync + 'static>(
+    socket_tx: &MaybeConnectedSocket<Arc<Tx>>, scid: ConnectionId<'static>,
+    packets: Vec<(Vec<u8>, SocketAddr)>,
+) {
+    if packets.is_empty() {
+        return;
+    }
+
+    let socket_clone = socket_tx.clone();
+
+    tokio::spawn(async move {
+        for (buf, to) in packets {
+            let _ = socket_clone.send_to(&buf, to).await.inspect_err(|error| {
+                log::error!("error sending client handshake packets to peer"; "scid" => ?scid, "peer_addr" => to, "error" => error.to_string());
+            });
+        }
+    });
 }
