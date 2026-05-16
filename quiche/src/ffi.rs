@@ -1340,6 +1340,7 @@ pub extern "C" fn quiche_stream_iter_free(iter: *mut StreamIter) {
 pub struct Stats {
     recv: usize,
     sent: usize,
+    acked: usize,
     lost: usize,
     spurious_lost: usize,
     retrans: usize,
@@ -1388,6 +1389,7 @@ pub extern "C" fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
 
     out.recv = stats.recv;
     out.sent = stats.sent;
+    out.acked = stats.acked;
     out.lost = stats.lost;
     out.spurious_lost = stats.spurious_lost;
     out.retrans = stats.retrans;
