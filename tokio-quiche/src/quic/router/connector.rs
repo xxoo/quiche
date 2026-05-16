@@ -86,9 +86,8 @@ impl ConnectionState {
         &mut self, scid: &ConnectionId<'static>,
     ) -> Option<PendingConnection> {
         match mem::replace(self, Self::Returned) {
-            Self::Pending(pending) if *scid == pending.conn.source_id() => {
-                Some(pending)
-            },
+            Self::Pending(pending) if *scid == pending.conn.source_id() =>
+                Some(pending),
             state => {
                 *self = state;
                 None
@@ -257,6 +256,7 @@ where
 
             Ok(Some(NewConnection {
                 conn,
+                server_config: None,
                 pending_cid: None,
                 initial_pkt: None,
                 cid_generator: None,
@@ -329,7 +329,7 @@ where
 
     fn handle_initials(
         &mut self, incoming: Incoming, hdr: Header<'static>,
-        _: &mut quiche::Config,
+        _: &mut crate::settings::Config,
     ) -> io::Result<Option<NewConnection>> {
         self.on_incoming(incoming, hdr)
     }

@@ -39,6 +39,7 @@ use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::settings::Config;
+use crate::settings::ServerConnectionConfig;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
@@ -270,7 +271,7 @@ where
         let new_connection = self.incoming_packet_handler.handle_initials(
             incoming,
             hdr,
-            self.config.as_mut(),
+            &mut self.config,
         )?;
 
         match new_connection {
@@ -296,6 +297,7 @@ where
     ) -> io::Result<()> {
         let NewConnection {
             conn,
+            server_config,
             pending_cid,
             cid_generator,
             handshake_start_time,
@@ -319,7 +321,11 @@ where
             local_addr,
             pending_cid: pending_cid.clone(),
             with_gso: self.config.has_gso,
-            pacing_offload: self.config.pacing_offload,
+            pacing_offload: server_config
+                .as_ref()
+                .map_or(self.config.pacing_offload, |config| {
+                    config.pacing_offload
+                }),
             with_pktinfo: if self.local_addr.is_ipv4() {
                 self.config.has_ippktinfo
             } else {
@@ -329,7 +335,11 @@ where
 
         let handshake_info = HandshakeInfo::new(
             handshake_start_time,
-            self.config.handshake_timeout,
+            server_config
+                .as_ref()
+                .map_or(self.config.handshake_timeout, |config| {
+                    config.handshake_timeout
+                }),
         );
 
         let conn = InitialQuicConnection::new(QuicConnectionParams {
@@ -817,8 +827,7 @@ pub trait InitialPacketHandler {
     }
 
     fn handle_initials(
-        &mut self, incoming: Incoming, hdr: Header<'static>,
-        quiche_config: &mut quiche::Config,
+        &mut self, incoming: Incoming, hdr: Header<'static>, config: &mut Config,
     ) -> io::Result<Option<NewConnection>>;
 }
 
@@ -827,6 +836,7 @@ pub trait InitialPacketHandler {
 pub struct NewConnection {
     /// See [`QuicConnectionParams::quiche_conn`].
     conn: Box<QuicheConnection>,
+    server_config: Option<ServerConnectionConfig>,
     pending_cid: Option<ConnectionId<'static>>,
     initial_pkt: Option<Incoming>,
     cid_generator: Option<SharedConnectionIdGenerator>,
@@ -1125,13 +1135,7 @@ mod tests {
 
         let acceptor = ConnectionAcceptor::new(
             ConnectionAcceptorConfig {
-                disable_client_ip_validation: config.disable_client_ip_validation,
-                qlog_dir: config.qlog_dir.clone(),
-                qlog_compression: config.qlog_compression,
-                keylog_file: config
-                    .keylog_file
-                    .as_ref()
-                    .and_then(|f| f.try_clone().ok()),
+                connection_hook: params.hooks.connection_hook.clone(),
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
             },
