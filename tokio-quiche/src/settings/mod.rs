@@ -28,12 +28,14 @@
 
 mod config;
 mod hooks;
+mod overrides;
 mod quic;
 mod tls;
 
 pub(crate) use self::config::*;
 
 pub use self::hooks::*;
+pub use self::overrides::*;
 pub use self::quic::*;
 pub use self::tls::*;
 
@@ -53,6 +55,12 @@ pub struct ConnectionParams<'a> {
     pub tls_cert: Option<TlsCertificatePaths<'a>>,
     /// Hooks to use for the connection.
     pub hooks: Hooks,
+    /// Additional server config profiles available for server connections.
+    ///
+    /// The default profile is built from [`settings`](Self::settings) and
+    /// [`tls_cert`](Self::tls_cert). Additional profiles inherit those values
+    /// unless their profile overrides replace them.
+    pub server_config_profiles: Vec<ServerConfigOverrides<'a>>,
     /// Set the session to attempt resumption.
     pub session: Option<Vec<u8>>,
     /// Custom destination connection ID to use for client connections.
@@ -74,7 +82,8 @@ impl core::fmt::Debug for ConnectionParams<'_> {
         let mut s = f.debug_struct("ConnectionParams");
         s.field("settings", &self.settings)
             .field("tls_cert", &self.tls_cert)
-            .field("hooks", &self.hooks);
+            .field("hooks", &self.hooks)
+            .field("server_config_profiles", &self.server_config_profiles);
 
         #[cfg(feature = "custom-client-dcid")]
         s.field("dcid", &self.dcid);
@@ -94,6 +103,7 @@ impl<'a> ConnectionParams<'a> {
             settings,
             tls_cert: Some(tls_cert),
             hooks,
+            server_config_profiles: Vec::new(),
             session: None,
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
@@ -111,6 +121,7 @@ impl<'a> ConnectionParams<'a> {
             settings,
             tls_cert,
             hooks,
+            server_config_profiles: Vec::new(),
             session: None,
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,

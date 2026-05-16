@@ -34,6 +34,8 @@ use qlog::writer::QlogCompression;
 use crate::result::QuicResult;
 use crate::settings::CertificateKind;
 use crate::settings::ConnectionParams;
+use crate::settings::Hooks;
+use crate::settings::QuicSettings;
 use crate::settings::TlsCertificatePaths;
 use crate::socket::SocketCapabilities;
 
@@ -56,6 +58,7 @@ pub(crate) struct Config {
     pub handshake_timeout: Option<Duration>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
+    server_config_profiles: Vec<ServerProfileConfig>,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -69,32 +72,23 @@ impl Config {
         params: &ConnectionParams, socket_capabilities: SocketCapabilities,
     ) -> QuicResult<Self> {
         let quic_settings = &params.settings;
-        let keylog_path = match &quic_settings.keylog_file {
-            Some(f) => Some(Cow::Borrowed(f.as_ref())),
-            None => std::env::var_os("SSLKEYLOGFILE").map(Cow::from),
-        };
-        let keylog_file = keylog_path.and_then(|path| if KEYLOGFILE_ENABLED {
-                File::options().create(true).append(true).open(path)
-                    .inspect_err(|e| log::warn!("failed to open SSLKEYLOGFILE"; "error" => e))
-                    .ok()
-            } else {
-                log::warn!("SSLKEYLOGFILE is set, but `--cfg capture_keylogs` was not enabled. No keys will be logged.");
-                None
-            });
+        let keylog_file = make_keylog_file(quic_settings, true);
 
-        let SocketCapabilities {
-            has_gso,
-            has_txtime: pacing_offload,
-            has_ippktinfo,
-            has_ipv6pktinfo,
-            ..
-        } = socket_capabilities;
-
-        #[cfg(feature = "gcongestion")]
-        let pacing_offload = quic_settings.enable_pacing && pacing_offload;
+        let has_gso = socket_capabilities.has_gso;
+        let pacing_offload =
+            make_pacing_offload(quic_settings, &socket_capabilities);
+        let has_ippktinfo = socket_capabilities.has_ippktinfo;
+        let has_ipv6pktinfo = socket_capabilities.has_ipv6pktinfo;
+        let server_config_profiles =
+            make_server_config_profiles(params, &socket_capabilities)?;
 
         Ok(Config {
-            quiche_config: make_quiche_config(params, keylog_file.is_some())?,
+            quiche_config: make_quiche_config_with_settings(
+                quic_settings,
+                params.tls_cert,
+                &params.hooks,
+                keylog_file.is_some(),
+            )?,
             disable_client_ip_validation: quic_settings
                 .disable_client_ip_validation,
             qlog_dir: quic_settings.qlog_dir.clone(),
@@ -108,18 +102,103 @@ impl Config {
             handshake_timeout: quic_settings.handshake_timeout,
             has_ippktinfo,
             has_ipv6pktinfo,
+            server_config_profiles,
         })
+    }
+
+    pub(crate) fn server_profile_config_mut(
+        &mut self, index: Option<usize>,
+    ) -> Option<ServerProfileConfigMut<'_>> {
+        match index {
+            None => Some(ServerProfileConfigMut::Default(self)),
+            Some(index) => self
+                .server_config_profiles
+                .get_mut(index)
+                .map(ServerProfileConfigMut::Additional),
+        }
+    }
+
+    pub(crate) fn server_profile_disable_client_ip_validation(
+        &self, index: Option<usize>,
+    ) -> Option<bool> {
+        match index {
+            None => Some(self.disable_client_ip_validation),
+            Some(index) => self
+                .server_config_profiles
+                .get(index)
+                .map(|profile| profile.disable_client_ip_validation),
+        }
     }
 }
 
-fn make_quiche_config(
-    params: &ConnectionParams, should_log_keys: bool,
+pub(crate) struct ServerConnectionConfig {
+    pub(crate) pacing_offload: bool,
+    pub(crate) handshake_timeout: Option<Duration>,
+}
+
+pub(crate) struct ServerProfileSnapshot<'a> {
+    pub(crate) qlog_dir: Option<&'a str>,
+    pub(crate) qlog_compression: QlogCompression,
+    pub(crate) keylog_file: Option<&'a File>,
+    pub(crate) connection_config: ServerConnectionConfig,
+}
+
+pub(crate) enum ServerProfileConfigMut<'a> {
+    Default(&'a mut Config),
+    Additional(&'a mut ServerProfileConfig),
+}
+
+impl ServerProfileConfigMut<'_> {
+    pub(crate) fn snapshot(&self) -> ServerProfileSnapshot<'_> {
+        match self {
+            Self::Default(config) => ServerProfileSnapshot {
+                qlog_dir: config.qlog_dir.as_deref(),
+                qlog_compression: config.qlog_compression,
+                keylog_file: config.keylog_file.as_ref(),
+                connection_config: ServerConnectionConfig {
+                    pacing_offload: config.pacing_offload,
+                    handshake_timeout: config.handshake_timeout,
+                },
+            },
+
+            Self::Additional(profile) => ServerProfileSnapshot {
+                qlog_dir: profile.qlog_dir.as_deref(),
+                qlog_compression: profile.qlog_compression,
+                keylog_file: profile.keylog_file.as_ref(),
+                connection_config: ServerConnectionConfig {
+                    pacing_offload: profile.pacing_offload,
+                    handshake_timeout: profile.handshake_timeout,
+                },
+            },
+        }
+    }
+
+    pub(crate) fn quiche_config_mut(&mut self) -> &mut quiche::Config {
+        match self {
+            Self::Default(config) => &mut config.quiche_config,
+            Self::Additional(profile) => &mut profile.quiche_config,
+        }
+    }
+}
+
+pub(crate) struct ServerProfileConfig {
+    quiche_config: quiche::Config,
+    qlog_dir: Option<String>,
+    qlog_compression: QlogCompression,
+    keylog_file: Option<File>,
+    disable_client_ip_validation: bool,
+    pacing_offload: bool,
+    handshake_timeout: Option<Duration>,
+}
+
+fn make_quiche_config_with_settings(
+    quic_settings: &QuicSettings, tls_cert: Option<TlsCertificatePaths>,
+    hooks: &Hooks, should_log_keys: bool,
 ) -> QuicResult<quiche::Config> {
-    let ssl_ctx_builder = params
-        .hooks
+    let ssl_ctx_builder = hooks
         .connection_hook
         .as_ref()
-        .zip(params.tls_cert)
+        .zip(tls_cert)
         .and_then(|(hook, tls)| hook.create_custom_ssl_context_builder(tls));
 
     let mut config = if let Some(builder) = ssl_ctx_builder {
@@ -128,10 +207,8 @@ fn make_quiche_config(
             builder,
         )?
     } else {
-        quiche_config_with_tls(params.tls_cert)?
+        quiche_config_with_tls(tls_cert)?
     };
-
-    let quic_settings = &params.settings;
 
     let alpns: Vec<&[u8]> =
         quic_settings.alpn.iter().map(Vec::as_slice).collect();
@@ -214,7 +291,7 @@ fn make_quiche_config(
             track_unknown_transport_params,
         );
     }
-    if params.settings.enable_early_data {
+    if quic_settings.enable_early_data {
         config.enable_early_data();
     }
 
@@ -223,6 +300,77 @@ fn make_quiche_config(
     }
 
     Ok(config)
+}
+
+fn make_server_config_profiles(
+    params: &ConnectionParams, socket_capabilities: &SocketCapabilities,
+) -> QuicResult<Vec<ServerProfileConfig>> {
+    let mut profiles = Vec::with_capacity(params.server_config_profiles.len());
+
+    for profile in &params.server_config_profiles {
+        let mut settings = params.settings.clone();
+        profile.apply_to(&mut settings);
+
+        let keylog_file =
+            make_keylog_file(&settings, profile.keylog_file.is_none());
+        let disable_client_ip_validation = settings.disable_client_ip_validation;
+        let quiche_config = make_quiche_config_with_settings(
+            &settings,
+            profile.tls_cert.or(params.tls_cert),
+            &params.hooks,
+            keylog_file.is_some(),
+        )?;
+        let pacing_offload = make_pacing_offload(&settings, socket_capabilities);
+        let handshake_timeout = settings.handshake_timeout;
+
+        profiles.push(ServerProfileConfig {
+            quiche_config,
+            qlog_dir: settings.qlog_dir,
+            qlog_compression: settings.qlog_compression,
+            keylog_file,
+            disable_client_ip_validation,
+            pacing_offload,
+            handshake_timeout,
+        });
+    }
+
+    Ok(profiles)
+}
+
+fn make_keylog_file(
+    quic_settings: &QuicSettings, use_env_fallback: bool,
+) -> Option<File> {
+    let keylog_path = match &quic_settings.keylog_file {
+        Some(f) => Some(Cow::Borrowed(f.as_ref())),
+        None if use_env_fallback =>
+            std::env::var_os("SSLKEYLOGFILE").map(Cow::from),
+        None => None,
+    };
+
+    keylog_path.and_then(|path| {
+        if KEYLOGFILE_ENABLED {
+            File::options().create(true).append(true).open(path)
+                .inspect_err(|e| log::warn!("failed to open SSLKEYLOGFILE"; "error" => e))
+                .ok()
+        } else {
+            log::warn!("SSLKEYLOGFILE is set, but `--cfg capture_keylogs` was not enabled. No keys will be logged.");
+            None
+        }
+    })
+}
+
+fn make_pacing_offload(
+    quic_settings: &QuicSettings, socket_capabilities: &SocketCapabilities,
+) -> bool {
+    let pacing_offload = socket_capabilities.has_txtime;
+
+    #[cfg(feature = "gcongestion")]
+    let pacing_offload = quic_settings.enable_pacing && pacing_offload;
+
+    #[cfg(not(feature = "gcongestion"))]
+    let _ = quic_settings;
+
+    pacing_offload
 }
 
 fn quiche_config_with_tls(
@@ -270,4 +418,69 @@ fn read_file(path: &str) -> QuicResult<Vec<u8>> {
     std::fs::read(path)
         .with_context(|| format!("read {path}"))
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use crate::settings::ConnectionParams;
+    use crate::settings::ServerConfigOverrides;
+    use crate::socket::SocketCapabilities;
+    use std::time::Duration;
+
+    #[test]
+    fn server_config_profiles_apply_overrides() {
+        let mut params = ConnectionParams::default();
+        params.server_config_profiles.push(ServerConfigOverrides {
+            qlog_dir: Some(Some("/tmp/tokio-quiche-qlog".to_string())),
+            handshake_timeout: Some(Some(Duration::from_secs(7))),
+            disable_client_ip_validation: Some(true),
+            max_amplification_factor: Some(10),
+            verify_peer: Some(true),
+            ..Default::default()
+        });
+
+        let mut config =
+            Config::new(&params, SocketCapabilities::default()).unwrap();
+        let profile = config.server_profile_config_mut(Some(0)).unwrap();
+        let snapshot = profile.snapshot();
+
+        assert_eq!(snapshot.qlog_dir.as_deref(), Some("/tmp/tokio-quiche-qlog"));
+        assert_eq!(
+            snapshot.connection_config.handshake_timeout,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            config.server_profile_disable_client_ip_validation(Some(0)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn server_config_profiles_default_index_uses_base_settings() {
+        let mut params = ConnectionParams::default();
+        params.settings.disable_client_ip_validation = true;
+
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+
+        assert_eq!(
+            config.server_profile_disable_client_ip_validation(None),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn server_config_profiles_unknown_index_is_absent() {
+        let mut params = ConnectionParams::default();
+        params
+            .server_config_profiles
+            .push(ServerConfigOverrides::default());
+
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+
+        assert_eq!(
+            config.server_profile_disable_client_ip_validation(Some(1)),
+            None
+        );
+    }
 }

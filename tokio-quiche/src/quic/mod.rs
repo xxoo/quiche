@@ -124,6 +124,7 @@ pub use self::connection::Incoming;
 pub use self::connection::QuicCommand;
 pub use self::connection::QuicConnectionStats;
 pub use self::connection::SimpleConnectionIdGenerator;
+pub use self::hooks::ClientInitialInfo;
 pub use self::hooks::ConnectionHook;
 
 /// Alias of [quiche::Connection] used internally by the crate.
@@ -303,13 +304,7 @@ where
 
     let acceptor = ConnectionAcceptor::new(
         ConnectionAcceptorConfig {
-            disable_client_ip_validation: config.disable_client_ip_validation,
-            qlog_dir: config.qlog_dir.clone(),
-            qlog_compression: config.qlog_compression,
-            keylog_file: config
-                .keylog_file
-                .as_ref()
-                .and_then(|f| f.try_clone().ok()),
+            connection_hook: params.hooks.connection_hook.clone(),
             #[cfg(target_os = "linux")]
             with_pktinfo: if local_addr.is_ipv4() {
                 config.has_ippktinfo

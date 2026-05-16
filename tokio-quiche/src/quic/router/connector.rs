@@ -179,6 +179,7 @@ where
 
             Ok(Some(NewConnection {
                 conn,
+                server_config: None,
                 pending_cid: None,
                 initial_pkt: None,
                 cid_generator: None,
@@ -251,7 +252,7 @@ where
 
     fn handle_initials(
         &mut self, incoming: Incoming, hdr: Header<'static>,
-        _: &mut quiche::Config,
+        _: &mut crate::settings::Config,
     ) -> io::Result<Option<NewConnection>> {
         self.on_incoming(incoming, hdr)
     }

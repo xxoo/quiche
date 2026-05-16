@@ -24,7 +24,6 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::fs::File;
 use std::io;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,7 +33,6 @@ use datagram_socket::DatagramSocketSendExt;
 use datagram_socket::MAX_DATAGRAM_SIZE;
 use qlog::writer::make_qlog_writer_from_path;
 use qlog::writer::qlog_file_name;
-use qlog::writer::QlogCompression;
 use quiche::ConnectionId;
 use quiche::Header;
 use quiche::RetryConnectionIds;
@@ -46,7 +44,10 @@ use crate::metrics::Metrics;
 use crate::quic::addr_validation_token::AddrValidationTokenManager;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::quic::router::NewConnection;
+use crate::quic::ClientInitialInfo;
+use crate::quic::ConnectionHook;
 use crate::quic::Incoming;
+use crate::settings::Config;
 use crate::QuicResultExt;
 
 use super::InitialPacketHandler;
@@ -62,10 +63,8 @@ pub(crate) struct ConnectionAcceptor<S, M> {
 }
 
 pub(crate) struct ConnectionAcceptorConfig {
-    pub(crate) disable_client_ip_validation: bool,
-    pub(crate) qlog_dir: Option<String>,
-    pub(crate) qlog_compression: QlogCompression,
-    pub(crate) keylog_file: Option<File>,
+    pub(crate) connection_hook:
+        Option<Arc<dyn ConnectionHook + Send + Sync + 'static>>,
     #[cfg(target_os = "linux")]
     pub(crate) with_pktinfo: bool,
 }
@@ -91,37 +90,52 @@ where
 
     fn accept_conn(
         &mut self, incoming: Incoming, retry_cids: Option<RetryConnectionIds>,
-        pending_cid: ConnectionId<'static>, quiche_config: &mut quiche::Config,
+        pending_cid: ConnectionId<'static>, config: &mut Config,
+        profile_index: Option<usize>,
     ) -> io::Result<Option<NewConnection>> {
         let handshake_start_time = Instant::now();
         let scid = self.cid_generator.new_connection_id();
 
-        let mut conn = if let Some(retry_cids) = retry_cids {
-            quiche::accept_with_retry(
-                &scid,
-                retry_cids,
-                incoming.local_addr,
-                incoming.peer_addr,
-                quiche_config,
-            )
-        } else {
-            quiche::accept_with_buf_factory(
-                &scid,
-                None,
-                incoming.local_addr,
-                incoming.peer_addr,
-                quiche_config,
-            )
+        let Some(mut profile) = config.server_profile_config_mut(profile_index)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                server_profile_not_found(profile_index),
+            ));
+        };
+
+        let mut conn = {
+            let quiche_config = profile.quiche_config_mut();
+            if let Some(retry_cids) = retry_cids {
+                quiche::accept_with_retry(
+                    &scid,
+                    retry_cids,
+                    incoming.local_addr,
+                    incoming.peer_addr,
+                    quiche_config,
+                )
+            } else {
+                quiche::accept_with_buf_factory(
+                    &scid,
+                    None,
+                    incoming.local_addr,
+                    incoming.peer_addr,
+                    quiche_config,
+                )
+            }
         }
         .into_io()?;
 
-        if let Some(qlog_dir) = &self.config.qlog_dir {
+        let profile_snapshot = profile.snapshot();
+
+        if let Some(qlog_dir) = &profile_snapshot.qlog_dir {
             let id = format!("{:?}", &scid);
             let path = std::path::Path::new(qlog_dir)
-                .join(qlog_file_name(&id, self.config.qlog_compression));
-            if let Ok(writer) =
-                make_qlog_writer_from_path(&path, self.config.qlog_compression)
-            {
+                .join(qlog_file_name(&id, profile_snapshot.qlog_compression));
+            if let Ok(writer) = make_qlog_writer_from_path(
+                &path,
+                profile_snapshot.qlog_compression,
+            ) {
                 conn.set_qlog(
                     writer,
                     "tokio-quiche qlog".to_string(),
@@ -130,7 +144,7 @@ where
             }
         }
 
-        if let Some(keylog_file) = &self.config.keylog_file {
+        if let Some(keylog_file) = profile_snapshot.keylog_file {
             if let Ok(keylog_clone) = keylog_file.try_clone() {
                 conn.set_keylog(Box::new(keylog_clone));
             }
@@ -138,6 +152,7 @@ where
 
         Ok(Some(NewConnection {
             conn: Box::new(conn),
+            server_config: Some(profile_snapshot.connection_config),
             handshake_start_time,
             pending_cid: Some(pending_cid),
             cid_generator: Some(Arc::clone(&self.cid_generator)),
@@ -207,6 +222,25 @@ where
                 .into_io()
         })
     }
+
+    fn select_profile(&self, incoming: &Incoming, hdr: &Header) -> Option<usize> {
+        let token_present =
+            hdr.token.as_ref().is_some_and(|token| !token.is_empty());
+        self.config
+            .connection_hook
+            .as_ref()
+            .map(|hook| {
+                hook.select_server_config_profile(&ClientInitialInfo {
+                    peer_addr: incoming.peer_addr,
+                    local_addr: incoming.local_addr,
+                    version: hdr.version,
+                    scid: &hdr.scid,
+                    dcid: &hdr.dcid,
+                    token_present,
+                })
+            })
+            .flatten()
+    }
 }
 
 impl<S, M> InitialPacketHandler for ConnectionAcceptor<S, M>
@@ -216,7 +250,7 @@ where
 {
     fn handle_initials(
         &mut self, incoming: Incoming, hdr: quiche::Header<'static>,
-        quiche_config: &mut quiche::Config,
+        config: &mut Config,
     ) -> io::Result<Option<NewConnection>> {
         if hdr.ty != PacketType::Initial {
             // Non-initial packets should have a valid CID, but we want to have
@@ -234,8 +268,25 @@ where
             });
         }
 
-        if self.config.disable_client_ip_validation {
-            return self.accept_conn(incoming, None, hdr.dcid, quiche_config);
+        let profile_index = self.select_profile(&incoming, &hdr);
+
+        let Some(disable_client_ip_validation) =
+            config.server_profile_disable_client_ip_validation(profile_index)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                server_profile_not_found(profile_index),
+            ));
+        };
+
+        if disable_client_ip_validation {
+            return self.accept_conn(
+                incoming,
+                None,
+                hdr.dcid,
+                config,
+                profile_index,
+            );
         }
 
         // NOTE: token is always present in Initial packets
@@ -256,6 +307,19 @@ where
             retry_source_cid: &hdr.dcid,
         });
 
-        self.accept_conn(incoming, retry_cids, hdr.dcid.clone(), quiche_config)
+        self.accept_conn(
+            incoming,
+            retry_cids,
+            hdr.dcid.clone(),
+            config,
+            profile_index,
+        )
+    }
+}
+
+fn server_profile_not_found(index: Option<usize>) -> String {
+    match index {
+        Some(index) => format!("unknown server config profile index {index}"),
+        None => "default server config profile is missing".to_string(),
     }
 }
