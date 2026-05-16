@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use foundations::settings::settings;
+
 /// TLS credentials to authenticate the endpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct TlsCertificatePaths<'p> {
@@ -46,4 +48,27 @@ pub enum CertificateKind {
     ///
     /// [Raw public key]: https://datatracker.ietf.org/doc/html/rfc7250
     RawPublicKey,
+}
+
+/// Trusted certificate roots for peer certificate verification.
+#[settings]
+#[derive(PartialEq, Eq)]
+pub enum PeerTrustRoots {
+    /// Use the platform or TLS backend's default trust roots.
+    #[default]
+    System,
+
+    /// Load trusted CA certificates from a PEM file.
+    CustomFile(CustomFileTrustRoots),
+}
+
+/// Trusted certificate roots loaded from a PEM file.
+#[settings]
+#[derive(PartialEq, Eq)]
+pub struct CustomFileTrustRoots {
+    /// Path to a PEM file containing trusted CA certificates.
+    pub path: String,
+
+    /// Whether to also include the platform or TLS backend's default roots.
+    pub include_system_roots: bool,
 }
