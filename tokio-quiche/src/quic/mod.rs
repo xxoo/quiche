@@ -285,7 +285,7 @@ where
         socket.local_addr,
         ClientConnector::new(
             socket_tx,
-            quiche_conn,
+            Box::new(quiche_conn),
             params.zero_rtt_dgrams.clone(),
             params.zero_rtt_streams.clone(),
         ),

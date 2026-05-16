@@ -63,7 +63,7 @@ pub(crate) struct ClientConnector<Tx> {
 /// State the connecting connection is in.
 enum ConnectionState {
     /// Connection hasn't had any initials sent for it
-    Queued(QuicheConnection),
+    Queued(Box<QuicheConnection>),
     /// It's currently in a QUIC handshake
     Pending(PendingConnection),
     /// It's been returned to the
@@ -72,7 +72,7 @@ enum ConnectionState {
 }
 
 impl ConnectionState {
-    fn take_if_queued(&mut self) -> Option<QuicheConnection> {
+    fn take_if_queued(&mut self) -> Option<Box<QuicheConnection>> {
         match mem::replace(self, Self::Returned) {
             Self::Queued(conn) => Some(conn),
             state => {
@@ -86,8 +86,9 @@ impl ConnectionState {
         &mut self, scid: &ConnectionId<'static>,
     ) -> Option<PendingConnection> {
         match mem::replace(self, Self::Returned) {
-            Self::Pending(pending) if *scid == pending.conn.source_id() =>
-                Some(pending),
+            Self::Pending(pending) if *scid == pending.conn.source_id() => {
+                Some(pending)
+            },
             state => {
                 *self = state;
                 None
@@ -99,7 +100,7 @@ impl ConnectionState {
 /// A [`PendingConnection`] holds an internal [`quiche::Connection`] and an
 /// optional timeout [`Key`].
 struct PendingConnection {
-    conn: QuicheConnection,
+    conn: Box<QuicheConnection>,
     timeout_key: Option<Key>,
     handshake_start_time: Instant,
 }
@@ -109,7 +110,7 @@ where
     Tx: DatagramSocketSend + Send + 'static,
 {
     pub(crate) fn new(
-        socket_tx: Arc<Tx>, connection: QuicheConnection,
+        socket_tx: Arc<Tx>, connection: Box<QuicheConnection>,
         zero_rtt_dgrams: Vec<Vec<u8>>, zero_rtt_streams: Vec<ZeroRttStream>,
     ) -> Self {
         Self {
@@ -184,7 +185,7 @@ where
     ///
     /// This sends any pending packets and arms the connection's timeout timer.
     fn set_connection_to_pending(
-        &mut self, mut conn: QuicheConnection,
+        &mut self, mut conn: Box<QuicheConnection>,
     ) -> io::Result<()> {
         let mut packets = drain_conn_send(&mut conn)?;
         self.queue_zero_rtt_dgrams(&mut conn)?;
