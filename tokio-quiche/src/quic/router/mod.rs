@@ -27,11 +27,14 @@
 pub(crate) mod acceptor;
 pub(crate) mod connector;
 
+use super::connection::ClientMigrationRequest;
+use super::connection::ConnectionEndpointState;
 use super::connection::ConnectionMap;
 use super::connection::HandshakeInfo;
 use super::connection::Incoming;
 use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
+use super::connection::SimpleConnectionIdGenerator;
 use super::io::worker::WriterConfig;
 use super::QuicheConnection;
 use crate::metrics::labels;
@@ -39,6 +42,7 @@ use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::settings::Config;
+use crate::socket::MigratableUdpSocket;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
@@ -142,6 +146,11 @@ where
     socket_tx: Arc<Tx>,
     socket_rx: Rx,
     local_addr: SocketAddr,
+    endpoint_state: Option<ConnectionEndpointState>,
+    client_migration_tx: Option<mpsc::UnboundedSender<ClientMigrationRequest>>,
+    client_migration_rx: Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
+    client_migration_socket: Option<MigratableUdpSocket>,
+    client_cid_generator: Option<SharedConnectionIdGenerator>,
     config: Config,
     conns: ConnectionMap,
     incoming_packet_handler: I,
@@ -185,6 +194,11 @@ where
         (
             InboundPacketRouter {
                 local_addr,
+                endpoint_state: None,
+                client_migration_tx: None,
+                client_migration_rx: None,
+                client_migration_socket: None,
+                client_cid_generator: None,
                 socket_tx,
                 socket_rx,
                 conns: ConnectionMap::default(),
@@ -224,6 +238,47 @@ where
             },
             accept_stream,
         )
+    }
+
+    pub(crate) fn new_with_endpoint_state(
+        config: Config, socket_tx: Arc<Tx>, socket_rx: Rx,
+        local_addr: SocketAddr, endpoint_state: ConnectionEndpointState,
+        incoming_packet_handler: I, metrics: M,
+    ) -> (Self, ConnStream<Tx, M>) {
+        let (mut router, stream) = Self::new(
+            config,
+            socket_tx,
+            socket_rx,
+            local_addr,
+            incoming_packet_handler,
+            metrics,
+        );
+        router.endpoint_state = Some(endpoint_state);
+        (router, stream)
+    }
+
+    pub(crate) fn new_with_client_migration(
+        config: Config, socket_tx: Arc<Tx>, socket_rx: Rx,
+        local_addr: SocketAddr, endpoint_state: ConnectionEndpointState,
+        client_migration_tx: mpsc::UnboundedSender<ClientMigrationRequest>,
+        client_migration_rx: mpsc::UnboundedReceiver<ClientMigrationRequest>,
+        client_migration_socket: MigratableUdpSocket, incoming_packet_handler: I,
+        metrics: M,
+    ) -> (Self, ConnStream<Tx, M>) {
+        let (mut router, stream) = Self::new_with_endpoint_state(
+            config,
+            socket_tx,
+            socket_rx,
+            local_addr,
+            endpoint_state,
+            incoming_packet_handler,
+            metrics,
+        );
+        router.client_migration_tx = Some(client_migration_tx);
+        router.client_migration_rx = Some(client_migration_rx);
+        router.client_migration_socket = Some(client_migration_socket);
+        router.client_cid_generator = Some(Arc::new(SimpleConnectionIdGenerator));
+        (router, stream)
     }
 
     fn on_incoming(&mut self, mut incoming: Incoming) -> io::Result<()> {
@@ -297,7 +352,7 @@ where
         let NewConnection {
             conn,
             pending_cid,
-            cid_generator,
+            mut cid_generator,
             handshake_start_time,
             initial_pkt,
         } = new_connection;
@@ -331,6 +386,12 @@ where
             handshake_start_time,
             self.config.handshake_timeout,
         );
+        if cid_generator.is_none() {
+            cid_generator = self.client_cid_generator.clone();
+        }
+        let endpoint_state = self.endpoint_state.clone().unwrap_or_else(|| {
+            ConnectionEndpointState::new(local_addr, peer_addr)
+        });
 
         let conn = InitialQuicConnection::new(QuicConnectionParams {
             writer_cfg,
@@ -345,8 +406,10 @@ where
             handshake_info,
             quiche_conn: conn,
             socket: Arc::clone(&self.socket_tx),
-            local_addr,
-            peer_addr,
+            endpoint_state,
+            client_migration_tx: self.client_migration_tx.clone(),
+            client_migration_rx: self.client_migration_rx.take(),
+            client_migration_socket: self.client_migration_socket.clone(),
         });
 
         conn.audit_log_stats
@@ -693,9 +756,12 @@ where
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        let server_addr = self.local_addr;
-
         loop {
+            let server_addr = self
+                .endpoint_state
+                .as_ref()
+                .map_or(self.local_addr, |state| state.local_addr());
+
             if let Err(error) = self.incoming_packet_handler.update(cx) {
                 // This is so rare that it's easier to spawn a separate task
                 let sender = self.accept_sink.clone();

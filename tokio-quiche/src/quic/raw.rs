@@ -43,6 +43,7 @@ use std::task::Poll;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use super::connection::ConnectionEndpointState;
 use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
@@ -128,8 +129,10 @@ where
         handshake_info: HandshakeInfo::new(Instant::now(), None),
         quiche_conn: Box::new(quiche_conn),
         socket,
-        local_addr,
-        peer_addr,
+        endpoint_state: ConnectionEndpointState::new(local_addr, peer_addr),
+        client_migration_tx: None,
+        client_migration_rx: None,
+        client_migration_socket: None,
     };
 
     let conn = InitialQuicConnection::new(conn_params);

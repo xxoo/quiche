@@ -29,6 +29,7 @@
 mod capabilities;
 mod connected;
 mod listener;
+mod migratable;
 
 pub use self::capabilities::SocketCapabilities;
 #[cfg(target_os = "linux")]
@@ -36,3 +37,4 @@ pub use self::capabilities::SocketCapabilitiesBuilder;
 pub use self::connected::BoxedSocket;
 pub use self::connected::Socket;
 pub use self::listener::QuicListener;
+pub(crate) use self::migratable::MigratableUdpSocket;

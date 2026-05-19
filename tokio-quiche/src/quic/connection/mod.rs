@@ -53,7 +53,9 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::task::AbortOnDropHandle;
 
 use self::error::make_handshake_result;
@@ -72,6 +74,7 @@ use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
 use crate::quic::io::worker::INCOMING_QUEUE_SIZE;
 use crate::quic::router::ConnectionMapCommand;
+use crate::socket::MigratableUdpSocket;
 use crate::QuicResult;
 
 /// Wrapper for connection statistics recorded by [quiche].
@@ -83,6 +86,54 @@ pub struct QuicConnectionStats {
     pub path_stats: Option<quiche::PathStats>,
 }
 pub(crate) type QuicConnectionStatsShared = Arc<Mutex<QuicConnectionStats>>;
+
+#[derive(Debug)]
+struct ConnectionEndpoint {
+    local_addr: SocketAddr,
+    peer_addr: SocketAddr,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectionEndpointState(Arc<Mutex<ConnectionEndpoint>>);
+
+impl ConnectionEndpointState {
+    pub(crate) fn new(local_addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self(Arc::new(Mutex::new(ConnectionEndpoint {
+            local_addr,
+            peer_addr,
+        })))
+    }
+
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.0.lock().unwrap().local_addr
+    }
+
+    pub(crate) fn peer_addr(&self) -> SocketAddr {
+        self.0.lock().unwrap().peer_addr
+    }
+
+    pub(crate) fn set_local_addr(&self, local_addr: SocketAddr) {
+        self.0.lock().unwrap().local_addr = local_addr;
+    }
+}
+
+/// Result of a hard client socket migration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClientMigrationOutcome {
+    /// The local address used before migration.
+    pub previous_local_addr: SocketAddr,
+    /// The new local address used after migration.
+    pub local_addr: SocketAddr,
+    /// The peer address this connection remains connected to.
+    pub peer_addr: SocketAddr,
+}
+
+pub(crate) struct ClientMigrationRequest {
+    pub(crate) socket: UdpSocket,
+    pub(crate) local_addr: SocketAddr,
+    pub(crate) peer_addr: SocketAddr,
+    pub(crate) response: oneshot::Sender<QuicResult<ClientMigrationOutcome>>,
+}
 
 impl QuicConnectionStats {
     pub(crate) fn from_conn(qconn: &QuicheConnection) -> Self {
@@ -237,6 +288,7 @@ where
     stats: QuicConnectionStatsShared,
     pub(crate) incoming_ev_sender: mpsc::Sender<Incoming>,
     incoming_ev_receiver: mpsc::Receiver<Incoming>,
+    endpoint_state: ConnectionEndpointState,
 }
 
 impl<Tx, M> InitialQuicConnection<Tx, M>
@@ -249,6 +301,7 @@ where
         let (incoming_ev_sender, incoming_ev_receiver) =
             mpsc::channel(INCOMING_QUEUE_SIZE);
         let audit_log_stats = Arc::new(QuicAuditStats::new(params.scid.to_vec()));
+        let endpoint_state = params.endpoint_state.clone();
 
         let stats = Arc::new(Mutex::new(QuicConnectionStats::from_conn(
             &params.quiche_conn,
@@ -260,17 +313,18 @@ where
             stats,
             incoming_ev_sender,
             incoming_ev_receiver,
+            endpoint_state,
         }
     }
 
     /// The local address this connection listens on.
     pub fn local_addr(&self) -> SocketAddr {
-        self.params.local_addr
+        self.endpoint_state.local_addr()
     }
 
     /// The remote address for this connection.
     pub fn peer_addr(&self) -> SocketAddr {
-        self.params.peer_addr
+        self.endpoint_state.peer_addr()
     }
 
     /// [boring]'s SSL object for this connection.
@@ -316,11 +370,11 @@ where
         self.params.metrics.connections_in_memory().inc();
 
         let conn = QuicConnection {
-            local_addr: self.params.local_addr,
-            peer_addr: self.params.peer_addr,
+            endpoint_state: self.endpoint_state.clone(),
             audit_log_stats: Arc::clone(&self.audit_log_stats),
             stats: Arc::clone(&self.stats),
             scid: self.params.scid,
+            client_migration_tx: self.params.client_migration_tx.clone(),
         };
         let context = ConnectionStageContext {
             in_pkt: self.params.initial_pkt,
@@ -339,6 +393,9 @@ where
             write_state: WriteState::default(),
             conn_map_cmd_tx: self.params.conn_map_cmd_tx,
             cid_generator: self.params.cid_generator,
+            client_migration_rx: self.params.client_migration_rx,
+            client_migration_socket: self.params.client_migration_socket,
+            endpoint_state: self.endpoint_state,
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: self.params.init_rx_time,
             metrics: self.params.metrics.clone(),
@@ -481,8 +538,12 @@ where
     /// across an `.await`.
     pub quiche_conn: Box<QuicheConnection>,
     pub socket: Arc<Tx>,
-    pub local_addr: SocketAddr,
-    pub peer_addr: SocketAddr,
+    pub endpoint_state: ConnectionEndpointState,
+    pub client_migration_tx:
+        Option<mpsc::UnboundedSender<ClientMigrationRequest>>,
+    pub client_migration_rx:
+        Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
+    pub client_migration_socket: Option<MigratableUdpSocket>,
 }
 
 /// Metadata about an established QUIC connection.
@@ -496,24 +557,24 @@ where
 /// See the [module-level docs](crate::quic) for an overview of how a QUIC
 /// connection is handled internally.
 pub struct QuicConnection {
-    local_addr: SocketAddr,
-    peer_addr: SocketAddr,
+    endpoint_state: ConnectionEndpointState,
     audit_log_stats: Arc<QuicAuditStats>,
     stats: QuicConnectionStatsShared,
     scid: ConnectionId<'static>,
+    client_migration_tx: Option<mpsc::UnboundedSender<ClientMigrationRequest>>,
 }
 
 impl QuicConnection {
     /// The local address this connection listens on.
     #[inline]
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.endpoint_state.local_addr()
     }
 
     /// The remote address for this connection.
     #[inline]
     pub fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+        self.endpoint_state.peer_addr()
     }
 
     /// A handle to the [`QuicAuditStats`] for this connection.
@@ -542,6 +603,70 @@ impl QuicConnection {
     #[inline]
     pub fn scid(&self) -> &ConnectionId<'static> {
         &self.scid
+    }
+
+    /// Whether this connection can migrate to a new client UDP socket.
+    #[inline]
+    pub fn is_migratable(&self) -> bool {
+        self.client_migration_tx.is_some()
+    }
+
+    /// Hard-migrates this client connection to a new connected UDP socket.
+    ///
+    /// This v1 migration path does not keep the old socket alive while probing
+    /// the new path. Packets that arrive on the old socket after this call
+    /// succeeds are not read by tokio-quiche.
+    ///
+    /// The new socket must already be connected to the same peer address as
+    /// this connection. The peer must allow active migration and provide a
+    /// spare destination connection ID.
+    pub async fn migrate_socket(
+        &self, socket: UdpSocket,
+    ) -> QuicResult<ClientMigrationOutcome> {
+        let Some(client_migration_tx) = &self.client_migration_tx else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "connection is not migratable",
+            )
+            .into());
+        };
+
+        let local_addr = socket.local_addr()?;
+        let peer_addr = socket.peer_addr()?;
+        let expected_peer_addr = self.peer_addr();
+
+        if peer_addr != expected_peer_addr {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "migrated UDP socket peer address {peer_addr} does not \
+                     match connection peer address {expected_peer_addr}"
+                ),
+            )
+            .into());
+        }
+
+        let (response, response_rx) = oneshot::channel();
+        client_migration_tx
+            .send(ClientMigrationRequest {
+                socket,
+                local_addr,
+                peer_addr,
+                response,
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "connection migration worker is gone",
+                )
+            })?;
+
+        response_rx.await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "connection migration worker dropped the response",
+            )
+        })?
     }
 }
 
@@ -825,6 +950,84 @@ impl fmt::Debug for QuicCommand {
             Self::ConnectionStats(_) =>
                 f.debug_tuple("ConnectionStats").finish_non_exhaustive(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::ErrorKind;
+
+    fn connection(
+        peer_addr: SocketAddr,
+        client_migration_tx: Option<
+            mpsc::UnboundedSender<ClientMigrationRequest>,
+        >,
+    ) -> QuicConnection {
+        QuicConnection {
+            endpoint_state: ConnectionEndpointState::new(
+                "127.0.0.1:0".parse().unwrap(),
+                peer_addr,
+            ),
+            audit_log_stats: Arc::new(QuicAuditStats::new(vec![1, 2, 3, 4])),
+            stats: Arc::new(Mutex::new(QuicConnectionStats {
+                stats: quiche::Stats::default(),
+                path_stats: None,
+            })),
+            scid: ConnectionId::from_vec(vec![1, 2, 3, 4]),
+            client_migration_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn non_migratable_connection_rejects_socket_migration() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let conn = connection(peer.local_addr().unwrap(), None);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let error = conn.migrate_socket(socket).await.unwrap_err();
+        let error = error.downcast_ref::<io::Error>().unwrap();
+
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert!(!conn.is_migratable());
+    }
+
+    #[tokio::test]
+    async fn migratable_connection_rejects_unconnected_socket() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (client_migration_tx, _rx) = mpsc::unbounded_channel();
+        let conn =
+            connection(peer.local_addr().unwrap(), Some(client_migration_tx));
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let error = conn.migrate_socket(socket).await.unwrap_err();
+        let error = error.downcast_ref::<io::Error>().unwrap();
+
+        assert_eq!(error.kind(), ErrorKind::NotConnected);
+        assert!(conn.is_migratable());
+    }
+
+    #[tokio::test]
+    async fn migratable_connection_rejects_peer_addr_mismatch() {
+        let expected_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .connect(other_peer.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let (client_migration_tx, _rx) = mpsc::unbounded_channel();
+        let conn = connection(
+            expected_peer.local_addr().unwrap(),
+            Some(client_migration_tx),
+        );
+
+        let error = conn.migrate_socket(socket).await.unwrap_err();
+        let error = error.downcast_ref::<io::Error>().unwrap();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 }
 

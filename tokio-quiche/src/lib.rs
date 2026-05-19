@@ -140,6 +140,7 @@ pub use crate::http3::driver::ServerH3Driver;
 pub use crate::http3::ClientH3Connection;
 pub use crate::http3::ServerH3Connection;
 pub use crate::quic::connection::ApplicationOverQuic;
+pub use crate::quic::connection::ClientMigrationOutcome;
 pub use crate::quic::connection::ConnectionIdGenerator;
 pub use crate::quic::connection::InitialQuicConnection;
 pub use crate::quic::connection::QuicConnection;
