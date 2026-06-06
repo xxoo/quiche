@@ -129,7 +129,7 @@ where
         let profile_snapshot = profile.snapshot();
 
         if let Some(qlog_dir) = &profile_snapshot.qlog_dir {
-            let id = format!("{:?}", &scid);
+            let id = format!("{:?}", scid);
             let path = std::path::Path::new(qlog_dir)
                 .join(qlog_file_name(&id, profile_snapshot.qlog_compression));
             if let Ok(writer) = make_qlog_writer_from_path(
@@ -189,7 +189,7 @@ where
 
             #[cfg(target_os = "linux")]
             {
-                let from = Some(incoming.local_addr).filter(|_| with_pktinfo);
+                let from = with_pktinfo.then_some(incoming.local_addr);
                 let _ = crate::quic::io::gso::send_to(
                     udp,
                     to,
