@@ -2776,6 +2776,7 @@ impl<F: BufFactory> Connection<F> {
         params: TransportParams, is_server: bool, ssl: &mut boring::ssl::SslRef,
     ) -> Result<()> {
         use foreign_types_shared::ForeignTypeRef;
+        use std::mem::ManuallyDrop;
 
         // In order to apply the new parameter to the TLS state before TPs are
         // written into a TLS message, we need to re-encode all TPs immediately.
@@ -2783,17 +2784,14 @@ impl<F: BufFactory> Connection<F> {
         // Since we don't have direct access to the main `Connection` object, we
         // need to re-create the `Handshake` state from the `SslRef`.
         //
-        // SAFETY: the `Handshake` object must not be drop()ed, otherwise it
-        // would free the underlying BoringSSL structure.
-        let mut handshake =
-            unsafe { tls::Handshake::from_ptr(ssl.as_ptr() as _) };
-        handshake.set_quic_transport_params(&params, is_server)?;
+        // Wrap the temporary `Handshake` in `ManuallyDrop` because this is only
+        // a borrowed view of `ssl`. The caller retains ownership of the
+        // underlying BoringSSL object.
+        let mut handshake = ManuallyDrop::new(unsafe {
+            tls::Handshake::from_ptr(ssl.as_ptr() as _)
+        });
 
-        // Avoid running `drop(handshake)` as that would free the underlying
-        // handshake state.
-        std::mem::forget(handshake);
-
-        Ok(())
+        handshake.set_quic_transport_params(&params, is_server)
     }
 
     /// Sets the `use_initial_max_data_as_flow_control_win` flag during SSL
@@ -6542,6 +6540,36 @@ impl<F: BufFactory> Connection<F> {
         stream.recv.is_fin()
     }
 
+    /// Returns true if the specified stream is closed.
+    ///
+    /// For bidirectional streams this happens when both the receive and send
+    /// sides have signaled `fin`. For unidirectional streams only the
+    /// relevant direction is checked, depending on whether the stream was
+    /// created locally or not.
+    ///
+    /// This also returns true if the stream has already been collected, but
+    /// returns false if the stream was never opened.
+    #[inline]
+    pub fn stream_closed(&self, stream_id: u64) -> bool {
+        let Some(stream) = self.streams.get(stream_id) else {
+            return self.streams.is_collected(stream_id);
+        };
+
+        match (stream.bidi, stream.local) {
+            // For bidirectional streams both directions must have signaled
+            // FIN.
+            (true, _) => stream.recv.is_fin() && stream.send.is_fin(),
+
+            // For unidirectional streams created locally, only the send side
+            // is checked.
+            (false, true) => stream.send.is_fin(),
+
+            // For unidirectional streams created by the peer, only the
+            // receive side is checked.
+            (false, false) => stream.recv.is_fin(),
+        }
+    }
+
     /// Returns the number of bidirectional streams that can be created
     /// before the peer's stream count limit is reached.
     ///
@@ -8105,7 +8133,7 @@ impl<F: BufFactory> Connection<F> {
             self.undecryptable_pkts.clear();
 
             trace!("{} connection established: proto={:?} cipher={:?} curve={:?} sigalg={:?} resumed={} {:?}",
-                   &self.trace_id,
+                   self.trace_id,
                    std::str::from_utf8(self.application_proto()),
                    self.handshake.cipher(),
                    self.handshake.curve(),
