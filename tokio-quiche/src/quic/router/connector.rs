@@ -86,9 +86,8 @@ impl ConnectionState {
         &mut self, scid: &ConnectionId<'static>,
     ) -> Option<PendingConnection> {
         match mem::replace(self, Self::Returned) {
-            Self::Pending(pending) if *scid == pending.conn.source_id() => {
-                Some(pending)
-            },
+            Self::Pending(pending) if *scid == pending.conn.source_id() =>
+                Some(pending),
             state => {
                 *self = state;
                 None
