@@ -95,14 +95,18 @@ use crate::metrics::DefaultMetrics;
 use crate::metrics::Metrics;
 use crate::settings::Config;
 use crate::settings::ZeroRttStream;
+use crate::socket::MigratableUdpSocket;
 use crate::socket::QuicListener;
 use crate::socket::Socket;
+use crate::socket::SocketCapabilities;
 use crate::ClientH3Controller;
 use crate::ClientH3Driver;
 use crate::ConnectionParams;
 use crate::QuicConnectionStream;
 use crate::QuicResult;
 use crate::QuicResultExt;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 mod addr_validation_token;
 pub(crate) mod connection;
@@ -112,6 +116,8 @@ pub mod raw;
 mod router;
 
 use self::connection::ApplicationOverQuic;
+use self::connection::ClientMigrationRequest;
+use self::connection::ConnectionEndpointState;
 use self::connection::ConnectionIdGenerator as _;
 use self::connection::QuicConnection;
 use self::router::acceptor::ConnectionAcceptor;
@@ -119,6 +125,7 @@ use self::router::acceptor::ConnectionAcceptorConfig;
 use self::router::connector::ClientConnector;
 use self::router::InboundPacketRouter;
 
+pub use self::connection::ClientMigrationOutcome;
 pub use self::connection::ConnectionShutdownBehaviour;
 pub use self::connection::HandshakeError;
 pub use self::connection::HandshakeInfo;
@@ -167,6 +174,29 @@ where
     ))
 }
 
+/// Connects to an HTTP/3 server using a migratable UDP socket.
+///
+/// This is an opt-in variant of [`connect`] for clients that need to hard
+/// switch the underlying UDP socket after the QUIC connection is established.
+/// Callers are responsible for detecting network changes and providing a new
+/// connected [`UdpSocket`] via [`QuicConnection::migrate_socket`].
+///
+/// The migration path is not make-before-break: after a successful migration
+/// tokio-quiche only reads from and writes to the new socket.
+pub async fn connect_migratable(
+    socket: UdpSocket, host: Option<&str>,
+) -> QuicResult<(QuicConnection, ClientH3Controller)> {
+    let (h3_driver, h3_controller) =
+        ClientH3Driver::new(Http3Settings::default());
+    let mut params = ConnectionParams::default();
+    params.settings.max_idle_timeout = Some(Duration::from_secs(30));
+
+    Ok((
+        connect_migratable_with_config(socket, host, &params, h3_driver).await?,
+        h3_controller,
+    ))
+}
+
 /// Connects to a QUIC server using `socket` and the provided
 /// [`ApplicationOverQuic`].
 ///
@@ -184,6 +214,66 @@ pub async fn connect_with_config<Tx, Rx, App>(
 ) -> QuicResult<QuicConnection>
 where
     Tx: DatagramSocketSend + Send + 'static,
+    Rx: DatagramSocketRecv + Unpin + 'static,
+    App: ApplicationOverQuic,
+{
+    connect_with_config_inner(socket, host, params, app, None).await
+}
+
+/// Connects to a QUIC server using a migratable UDP socket and configuration.
+///
+/// The provided socket must already be connected to the peer. The peer must
+/// allow active migration and provide enough destination connection IDs for
+/// the later hard migration to succeed.
+pub async fn connect_migratable_with_config<App>(
+    socket: UdpSocket, host: Option<&str>, params: &ConnectionParams<'_>,
+    app: App,
+) -> QuicResult<QuicConnection>
+where
+    App: ApplicationOverQuic,
+{
+    let migratable_socket = MigratableUdpSocket::new(socket)?;
+    let local_addr = migratable_socket.local_addr();
+    let peer_addr = migratable_socket.peer_addr();
+    let endpoint_state = ConnectionEndpointState::new(local_addr, peer_addr);
+    let (client_migration_tx, client_migration_rx) = mpsc::unbounded_channel();
+
+    let socket = Socket {
+        send: migratable_socket.clone(),
+        recv: migratable_socket.clone(),
+        local_addr,
+        peer_addr,
+        capabilities: SocketCapabilities::default(),
+    };
+
+    connect_with_config_inner(
+        socket,
+        host,
+        params,
+        app,
+        Some(ClientMigrationSetup {
+            endpoint_state,
+            client_migration_tx,
+            client_migration_rx,
+            client_migration_socket: migratable_socket,
+        }),
+    )
+    .await
+}
+
+struct ClientMigrationSetup {
+    endpoint_state: ConnectionEndpointState,
+    client_migration_tx: mpsc::UnboundedSender<ClientMigrationRequest>,
+    client_migration_rx: mpsc::UnboundedReceiver<ClientMigrationRequest>,
+    client_migration_socket: MigratableUdpSocket,
+}
+
+async fn connect_with_config_inner<Tx, Rx, App>(
+    socket: Socket<Tx, Rx>, host: Option<&str>, params: &ConnectionParams<'_>,
+    app: App, client_migration: Option<ClientMigrationSetup>,
+) -> QuicResult<QuicConnection>
+where
+    Tx: DatagramSocketSend + Send + Sync + 'static,
     Rx: DatagramSocketRecv + Unpin + 'static,
     App: ApplicationOverQuic,
 {
@@ -279,19 +369,40 @@ where
     let socket_tx = Arc::new(socket.send);
     let socket_rx = socket.recv;
 
-    let (router, mut quic_connection_stream) = InboundPacketRouter::new(
-        client_config,
-        Arc::clone(&socket_tx),
-        socket_rx,
-        socket.local_addr,
-        ClientConnector::new(
-            socket_tx,
-            Box::new(quiche_conn),
-            params.zero_rtt_dgrams.clone(),
-            params.zero_rtt_streams.clone(),
-        ),
-        DefaultMetrics,
-    );
+    let (router, mut quic_connection_stream) =
+        if let Some(client_migration) = client_migration {
+            InboundPacketRouter::new_with_client_migration(
+                client_config,
+                Arc::clone(&socket_tx),
+                socket_rx,
+                socket.local_addr,
+                client_migration.endpoint_state,
+                client_migration.client_migration_tx,
+                client_migration.client_migration_rx,
+                client_migration.client_migration_socket,
+                ClientConnector::new(
+                    socket_tx,
+                    Box::new(quiche_conn),
+                    params.zero_rtt_dgrams.clone(),
+                    params.zero_rtt_streams.clone(),
+                ),
+                DefaultMetrics,
+            )
+        } else {
+            InboundPacketRouter::new(
+                client_config,
+                Arc::clone(&socket_tx),
+                socket_rx,
+                socket.local_addr,
+                ClientConnector::new(
+                    socket_tx,
+                    Box::new(quiche_conn),
+                    params.zero_rtt_dgrams.clone(),
+                    params.zero_rtt_streams.clone(),
+                ),
+                DefaultMetrics,
+            )
+        };
 
     // drive the packet router:
     tokio::spawn(async move {

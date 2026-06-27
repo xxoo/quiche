@@ -26,7 +26,17 @@
 
 use h3i::quiche;
 use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
+use tokio_quiche::http3::driver::ClientH3Controller;
+use tokio_quiche::http3::driver::ClientH3Event;
+use tokio_quiche::http3::driver::H3Event;
+use tokio_quiche::http3::driver::InboundFrame;
+use tokio_quiche::http3::driver::NewClientRequest;
+use tokio_quiche::quic::connect_migratable;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
+use tokio_quiche::quiche::h3::NameValue as _;
 use tokio_quiche::ConnectionIdGenerator as _;
 
 use crate::fixtures::*;
@@ -39,6 +49,143 @@ async fn test_passive_migration() {
 #[tokio::test]
 async fn test_active_migration() {
     run_migration_test(true, 23456).await;
+}
+
+#[tokio::test]
+async fn test_tokio_quiche_client_hard_migration() {
+    let mut quic_settings = QuicSettings::default();
+    quic_settings.active_connection_id_limit = 2;
+    quic_settings.disable_active_migration = false;
+    quic_settings.disable_dcid_reuse = false;
+
+    let (url, _) = start_server_with_settings(
+        quic_settings,
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(server_addr).await.unwrap();
+
+    let (conn, mut controller) = timeout(
+        Duration::from_secs(5),
+        connect_migratable(socket, Some("test.com")),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+
+    assert!(conn.is_migratable());
+    let initial_local_addr = conn.local_addr();
+
+    send_tokio_quiche_request(&mut controller, 1).await;
+
+    let migrated_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    migrated_socket.connect(server_addr).await.unwrap();
+    let expected_migrated_addr = migrated_socket.local_addr().unwrap();
+
+    let outcome =
+        timeout(Duration::from_secs(5), conn.migrate_socket(migrated_socket))
+            .await
+            .expect("migration timed out")
+            .expect("migration failed");
+
+    assert_eq!(outcome.previous_local_addr, initial_local_addr);
+    assert_eq!(outcome.local_addr, expected_migrated_addr);
+    assert_eq!(outcome.peer_addr, server_addr);
+    assert_eq!(conn.local_addr(), expected_migrated_addr);
+
+    send_tokio_quiche_request(&mut controller, 2).await;
+}
+
+#[tokio::test]
+async fn test_tokio_quiche_client_hard_migration_rejects_disabled_peer() {
+    let mut quic_settings = QuicSettings::default();
+    quic_settings.active_connection_id_limit = 2;
+    quic_settings.disable_active_migration = true;
+    quic_settings.disable_dcid_reuse = false;
+
+    let (url, _) = start_server_with_settings(
+        quic_settings,
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(server_addr).await.unwrap();
+
+    let (conn, mut controller) = timeout(
+        Duration::from_secs(5),
+        connect_migratable(socket, Some("test.com")),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+
+    send_tokio_quiche_request(&mut controller, 1).await;
+
+    let initial_local_addr = conn.local_addr();
+    let migrated_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    migrated_socket.connect(server_addr).await.unwrap();
+
+    timeout(Duration::from_secs(5), conn.migrate_socket(migrated_socket))
+        .await
+        .expect("migration timed out")
+        .expect_err("migration should fail when peer disabled it");
+
+    assert_eq!(conn.local_addr(), initial_local_addr);
+}
+
+#[tokio::test]
+async fn test_tokio_quiche_client_hard_migration_rejects_without_spare_cid() {
+    let mut quic_settings = QuicSettings::default();
+    quic_settings.active_connection_id_limit = 2;
+    quic_settings.disable_active_migration = false;
+    quic_settings.disable_dcid_reuse = false;
+
+    let (url, _) = start_server_with_settings(
+        quic_settings,
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(server_addr).await.unwrap();
+
+    let (conn, mut controller) = timeout(
+        Duration::from_secs(5),
+        connect_migratable(socket, Some("test.com")),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+
+    send_tokio_quiche_request(&mut controller, 1).await;
+
+    let first_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    first_socket.connect(server_addr).await.unwrap();
+    let first_migrated_addr = first_socket.local_addr().unwrap();
+
+    timeout(Duration::from_secs(5), conn.migrate_socket(first_socket))
+        .await
+        .expect("first migration timed out")
+        .expect("first migration failed");
+
+    let second_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    second_socket.connect(server_addr).await.unwrap();
+
+    timeout(Duration::from_secs(5), conn.migrate_socket(second_socket))
+        .await
+        .expect("second migration timed out")
+        .expect_err("second migration should fail without a spare DCID");
+
+    assert_eq!(conn.local_addr(), first_migrated_addr);
 }
 
 /// Tests that the client can migrate either actively or passively.
@@ -242,6 +389,73 @@ fn process_h3_events(
                 // Request is complete, return.
                 return (got_headers, true);
             },
+
+            _ => {},
+        }
+    }
+}
+
+async fn send_tokio_quiche_request(
+    controller: &mut ClientH3Controller, request_id: u64,
+) {
+    controller
+        .request_sender()
+        .send(NewClientRequest {
+            request_id,
+            headers: h3i_fixtures::default_headers(),
+            body_writer: None,
+        })
+        .unwrap();
+
+    let mut stream_id = None;
+
+    loop {
+        let event = timeout(
+            Duration::from_secs(5),
+            controller.event_receiver_mut().recv(),
+        )
+        .await
+        .expect("request event timed out")
+        .expect("client event stream closed");
+
+        match event {
+            ClientH3Event::NewOutboundRequest {
+                stream_id: id,
+                request_id: id_request_id,
+            } if id_request_id == request_id => stream_id = Some(id),
+
+            ClientH3Event::Core(H3Event::IncomingHeaders(incoming_headers))
+                if stream_id == Some(incoming_headers.stream_id) =>
+            {
+                assert!(incoming_headers.headers.iter().any(|header| {
+                    header.name() == b":status" && header.value() == b"200"
+                }));
+
+                let read_fin = incoming_headers.read_fin;
+                let mut recv = incoming_headers.recv;
+                if !read_fin {
+                    loop {
+                        let frame = timeout(Duration::from_secs(5), recv.recv())
+                            .await
+                            .expect("response body timed out")
+                            .expect("response body stream closed");
+
+                        match frame {
+                            InboundFrame::Body(_, true) => break,
+                            InboundFrame::Body(_, false) => {},
+                            InboundFrame::Datagram(_) => unreachable!(),
+                        }
+                    }
+                }
+
+                return;
+            },
+
+            ClientH3Event::Core(H3Event::ConnectionError(err)) =>
+                panic!("connection error while waiting for response: {err:?}"),
+
+            ClientH3Event::Core(H3Event::ConnectionShutdown(err)) =>
+                panic!("connection shutdown while waiting for response: {err:?}"),
 
             _ => {},
         }

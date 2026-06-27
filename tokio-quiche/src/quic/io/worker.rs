@@ -44,12 +44,17 @@ use super::utilization_estimator::BandwidthReporter;
 use crate::metrics::labels;
 use crate::metrics::Metrics;
 use crate::quic::connection::ApplicationOverQuic;
+use crate::quic::connection::ClientMigrationOutcome;
+use crate::quic::connection::ClientMigrationRequest;
+use crate::quic::connection::ConnectionEndpointState;
 use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::QuicConnectionStats;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::quic::router::ConnectionMapCommand;
 use crate::quic::QuicheConnection;
+use crate::socket::MigratableUdpSocket;
+use crate::BoxError;
 use crate::QuicResult;
 
 use boring::ssl::SslRef;
@@ -112,6 +117,10 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     pub(crate) write_state: WriteState,
     pub(crate) conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
     pub(crate) cid_generator: Option<SharedConnectionIdGenerator>,
+    pub(crate) client_migration_rx:
+        Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
+    pub(crate) client_migration_socket: Option<MigratableUdpSocket>,
+    pub(crate) endpoint_state: ConnectionEndpointState,
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub(crate) init_rx_time: Option<SystemTime>,
     pub(crate) metrics: M,
@@ -128,11 +137,23 @@ pub(crate) struct IoWorker<Tx, M, S> {
     write_state: WriteState,
     conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
     cid_generator: Option<SharedConnectionIdGenerator>,
+    client_migration_rx: Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
+    client_migration_socket: Option<MigratableUdpSocket>,
+    endpoint_state: ConnectionEndpointState,
     #[cfg(feature = "perf-quic-listener-metrics")]
     init_rx_time: Option<SystemTime>,
     metrics: M,
     conn_stage: S,
     bw_estimator: BandwidthReporter,
+}
+
+async fn recv_client_migration(
+    rx: &mut Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
+) -> Option<ClientMigrationRequest> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -155,6 +176,9 @@ where
             write_state: params.write_state,
             conn_map_cmd_tx: params.conn_map_cmd_tx,
             cid_generator: params.cid_generator,
+            client_migration_rx: params.client_migration_rx,
+            client_migration_socket: params.client_migration_socket,
+            endpoint_state: params.endpoint_state,
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: params.init_rx_time,
             metrics: params.metrics,
@@ -213,12 +237,99 @@ where
         }
     }
 
+    fn handle_client_migration(
+        &mut self, qconn: &mut QuicheConnection, request: ClientMigrationRequest,
+    ) {
+        let outcome = self.try_client_migration(
+            qconn,
+            request.socket,
+            request.local_addr,
+            request.peer_addr,
+        );
+
+        let _ = request.response.send(outcome);
+    }
+
+    fn try_client_migration(
+        &mut self, qconn: &mut QuicheConnection, socket: tokio::net::UdpSocket,
+        local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> QuicResult<ClientMigrationOutcome> {
+        let Some(client_migration_socket) = &self.client_migration_socket else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "connection is not migratable",
+            )
+            .into());
+        };
+
+        if peer_addr != self.cfg.peer_addr {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "migrated UDP socket peer address {peer_addr} does not \
+                     match connection peer address {}",
+                    self.cfg.peer_addr
+                ),
+            )
+            .into());
+        }
+
+        if !qconn.is_established() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "connection migration requires an established QUIC connection",
+            )
+            .into());
+        }
+
+        if qconn.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "connection is already closed",
+            )
+            .into());
+        }
+
+        if qconn
+            .peer_transport_params()
+            .is_some_and(|params| params.disable_active_migration)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "peer disabled active migration",
+            )
+            .into());
+        }
+
+        qconn
+            .probe_path(local_addr, peer_addr)
+            .map_err(|error| Box::new(error) as BoxError)?;
+        qconn
+            .migrate_source(local_addr)
+            .map_err(|error| Box::new(error) as BoxError)?;
+
+        let previous_local_addr =
+            client_migration_socket.replace(socket, local_addr, peer_addr)?;
+        self.cfg.local_addr = local_addr;
+        self.endpoint_state.set_local_addr(local_addr);
+        self.write_state.selected_path = None;
+        self.write_state.pending_paths = quiche::SocketAddrIter::default();
+        self.write_state.has_pending_data = true;
+
+        Ok(ClientMigrationOutcome {
+            previous_local_addr,
+            local_addr,
+            peer_addr,
+        })
+    }
+
     async fn work_loop<A: ApplicationOverQuic>(
         &mut self, qconn: &mut QuicheConnection,
         ctx: &mut ConnectionStageContext<A>,
     ) -> QuicResult<()> {
         const DEFAULT_SLEEP: Duration = Duration::from_secs(60);
         let mut current_deadline: Option<Instant> = None;
+        let mut client_migration_rx = self.client_migration_rx.take();
         let sleep = time::sleep(DEFAULT_SLEEP);
         tokio::pin!(sleep);
 
@@ -265,6 +376,7 @@ where
 
                     // Break if the connection is closed
                     if qconn.is_closed() {
+                        self.client_migration_rx = client_migration_rx;
                         return Ok(());
                     }
 
@@ -280,6 +392,7 @@ where
                     if let ControlFlow::Break(reason) =
                         self.conn_stage.on_flush(qconn, ctx)
                     {
+                        self.client_migration_rx = client_migration_rx;
                         return reason;
                     }
                 }
@@ -327,6 +440,14 @@ where
                     sleep.as_mut().reset((now + DEFAULT_SLEEP).into());
                 }
                 Some(pkt) = incoming_recv.recv() => ctx.in_pkt = Some(pkt),
+                Some(request) = recv_client_migration(&mut client_migration_rx),
+                    if client_migration_rx.is_some() =>
+                {
+                    self.handle_client_migration(qconn, request);
+                    self.write_state.next_release_time = None;
+                    current_deadline = None;
+                    sleep.as_mut().reset((now + DEFAULT_SLEEP).into());
+                }
                 directive = self.wait_for_data_or_handshake(qconn, application) => {
                     match directive? {
                         WaitForDataOrHandshakeDirective::Flush => {
@@ -338,6 +459,7 @@ where
             };
 
             if let ControlFlow::Break(reason) = self.conn_stage.post_wait(qconn) {
+                self.client_migration_rx = client_migration_rx;
                 return reason;
             }
         }
@@ -900,6 +1022,9 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             write_state: value.write_state,
             conn_map_cmd_tx: value.conn_map_cmd_tx,
             cid_generator: value.cid_generator,
+            client_migration_rx: value.client_migration_rx,
+            client_migration_socket: value.client_migration_socket,
+            endpoint_state: value.endpoint_state,
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: value.init_rx_time,
             metrics: value.metrics,
