@@ -26,6 +26,34 @@
 
 use crate::settings::TlsCertificatePaths;
 use boring::ssl::SslContextBuilder;
+use quiche::ConnectionId;
+use std::net::SocketAddr;
+
+/// Client information available while handling an Initial packet.
+///
+/// This information is intentionally limited to data that is available before
+/// creating the server-side [`quiche::Connection`]. TLS and HTTP/3 information
+/// such as SNI, ALPN, peer certificates, and request headers are not available
+/// at this point.
+pub struct ClientInitialInfo<'a> {
+    /// The address that sent the Initial packet.
+    pub peer_addr: SocketAddr,
+
+    /// The local address that received the Initial packet.
+    pub local_addr: SocketAddr,
+
+    /// The QUIC version from the packet header.
+    pub version: u32,
+
+    /// The source connection ID from the packet header.
+    pub scid: &'a ConnectionId<'a>,
+
+    /// The destination connection ID from the packet header.
+    pub dcid: &'a ConnectionId<'a>,
+
+    /// Whether the Initial packet carried a non-empty token.
+    pub token_present: bool,
+}
 
 /// A set of hooks executed at the level of a [quiche::Connection].
 pub trait ConnectionHook {
@@ -33,12 +61,21 @@ pub trait ConnectionHook {
     ///
     /// This method allows full customization of quiche's SSL context, for
     /// example to specify async callbacks during the QUIC handshake. It is
-    /// called once per socket during initial setup, and then reused across
-    /// all connections on that socket.
+    /// called once for the default profile during initial setup, and once for
+    /// each additional server config profile.
     ///
     /// Only called if both the hook and [`TlsCertificatePaths`] are set in
     /// [`ConnectionParams`](crate::ConnectionParams).
     fn create_custom_ssl_context_builder(
         &self, settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder>;
+
+    /// Selects a server config profile for an Initial packet.
+    ///
+    /// Returning `None` selects the default server config profile.
+    fn select_server_config_profile(
+        &self, _info: &ClientInitialInfo<'_>,
+    ) -> Option<usize> {
+        None
+    }
 }
