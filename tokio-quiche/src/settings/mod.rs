@@ -55,6 +55,27 @@ pub struct ConnectionParams<'a> {
     pub hooks: Hooks,
     /// Set the session to attempt resumption.
     pub session: Option<Vec<u8>>,
+    /// Raw QUIC DATAGRAM payloads to send as 0-RTT data on client connections.
+    ///
+    /// These payloads are sent before [`connect_with_config()`] returns, but
+    /// the function still only resolves after the QUIC handshake has
+    /// completed. A resumption session and early data support are required.
+    ///
+    /// [`connect_with_config()`]: crate::quic::connect_with_config
+    pub zero_rtt_dgrams: Vec<Vec<u8>>,
+    /// Data to send on client-initiated bidirectional streams as 0-RTT data on
+    /// client connections.
+    ///
+    /// Stream IDs are assigned by the entry's index in this vector. Use
+    /// [`ConnectionParams::zero_rtt_stream_id()`] to map an index to the
+    /// stream ID that applications should read or write.
+    ///
+    /// These payloads are sent before [`connect_with_config()`] returns, but
+    /// the function still only resolves after the QUIC handshake has
+    /// completed. A resumption session and early data support are required.
+    ///
+    /// [`connect_with_config()`]: crate::quic::connect_with_config
+    pub zero_rtt_streams: Vec<ZeroRttStream>,
     /// Custom destination connection ID to use for client connections.
     ///
     /// Be aware that [RFC 9000] places requirements for unpredictability and
@@ -95,6 +116,8 @@ impl<'a> ConnectionParams<'a> {
             tls_cert: Some(tls_cert),
             hooks,
             session: None,
+            zero_rtt_dgrams: Vec::new(),
+            zero_rtt_streams: Vec::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }
@@ -112,8 +135,36 @@ impl<'a> ConnectionParams<'a> {
             tls_cert,
             hooks,
             session: None,
+            zero_rtt_dgrams: Vec::new(),
+            zero_rtt_streams: Vec::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }
     }
+
+    /// Returns the stream ID used for the configured 0-RTT stream at `index`.
+    ///
+    /// Applications can use this to map `zero_rtt_streams[index]` to the stream
+    /// that carries the server's response.
+    pub fn zero_rtt_stream_id(index: usize) -> Option<u64> {
+        const MAX_ZERO_RTT_STREAM_INDEX: u64 = 1 << 60;
+
+        let index = u64::try_from(index).ok()?;
+
+        if index >= MAX_ZERO_RTT_STREAM_INDEX {
+            return None;
+        }
+
+        Some(index << 2)
+    }
+}
+
+/// Data to send on a predictable 0-RTT stream.
+#[derive(Clone, Debug, Default)]
+pub struct ZeroRttStream {
+    /// Payload to write on the stream.
+    pub data: Vec<u8>,
+
+    /// Whether to finish the stream after writing `data`.
+    pub fin: bool,
 }

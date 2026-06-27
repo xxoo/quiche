@@ -86,6 +86,7 @@ use std::time::Duration;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
+use octets::Octets;
 use qlog::writer::make_qlog_writer_from_path;
 use qlog::writer::qlog_file_name;
 
@@ -93,6 +94,7 @@ use crate::http3::settings::Http3Settings;
 use crate::metrics::DefaultMetrics;
 use crate::metrics::Metrics;
 use crate::settings::Config;
+use crate::settings::ZeroRttStream;
 use crate::socket::QuicListener;
 use crate::socket::Socket;
 use crate::ClientH3Controller;
@@ -184,6 +186,16 @@ where
     Rx: DatagramSocketRecv + Unpin + 'static,
     App: ApplicationOverQuic,
 {
+    if !params.zero_rtt_dgrams.is_empty() || !params.zero_rtt_streams.is_empty() {
+        if params.session.is_none() {
+            return Err("0-RTT data requires a resumption session".into());
+        }
+
+        if !params.settings.enable_early_data {
+            return Err("0-RTT data requires early data to be enabled".into());
+        }
+    }
+
     let mut client_config = Config::new(params, socket.capabilities)?;
     let scid = SimpleConnectionIdGenerator.new_connection_id();
 
@@ -228,6 +240,15 @@ where
         })?;
     }
 
+    if !params.zero_rtt_streams.is_empty() {
+        let session = params
+            .session
+            .as_deref()
+            .ok_or("0-RTT STREAMs require a resumption session")?;
+        let limits = zero_rtt_stream_limits_from_session(session)?;
+        validate_zero_rtt_streams(&params.zero_rtt_streams, limits)?;
+    }
+
     // Set the qlog writer here instead of in the `ClientConnector` to avoid
     // missing logs from early in the connection
     if let Some(qlog_dir) = &client_config.qlog_dir {
@@ -262,7 +283,12 @@ where
         Arc::clone(&socket_tx),
         socket_rx,
         socket.local_addr,
-        ClientConnector::new(socket_tx, Box::new(quiche_conn)),
+        ClientConnector::new(
+            socket_tx,
+            Box::new(quiche_conn),
+            params.zero_rtt_dgrams.clone(),
+            params.zero_rtt_streams.clone(),
+        ),
         DefaultMetrics,
     );
 
@@ -281,6 +307,104 @@ where
         .await
         .ok_or("unable to establish connection")??
         .start(app))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ZeroRttStreamLimits {
+    initial_max_data: u64,
+    initial_max_stream_data_bidi_remote: u64,
+    initial_max_streams_bidi: u64,
+}
+
+fn zero_rtt_stream_limits_from_session(
+    session: &[u8],
+) -> QuicResult<ZeroRttStreamLimits> {
+    const INITIAL_MAX_DATA: u64 = 0x0004;
+    const INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x0006;
+    const INITIAL_MAX_STREAMS_BIDI: u64 = 0x0008;
+
+    let mut session = Octets::with_slice(session);
+    let session_len = usize::try_from(session.get_u64()?)
+        .map_err(|_| "0-RTT session data is too large")?;
+    let _ = session.get_bytes(session_len)?;
+
+    let raw_params_len = usize::try_from(session.get_u64()?)
+        .map_err(|_| "0-RTT session transport parameters are too large")?;
+    let mut raw_params = session.get_bytes(raw_params_len)?;
+    let mut limits = ZeroRttStreamLimits::default();
+
+    while raw_params.cap() > 0 {
+        let id = raw_params.get_varint()?;
+        let len = usize::try_from(raw_params.get_varint()?)
+            .map_err(|_| "0-RTT session transport parameter is too large")?;
+        let mut value = raw_params.get_bytes(len)?;
+
+        match id {
+            INITIAL_MAX_DATA => {
+                limits.initial_max_data = value.get_varint()?;
+            },
+
+            INITIAL_MAX_STREAM_DATA_BIDI_REMOTE => {
+                limits.initial_max_stream_data_bidi_remote =
+                    value.get_varint()?;
+            },
+
+            INITIAL_MAX_STREAMS_BIDI => {
+                limits.initial_max_streams_bidi = value.get_varint()?;
+            },
+
+            _ => (),
+        }
+    }
+
+    Ok(limits)
+}
+
+fn validate_zero_rtt_streams(
+    streams: &[ZeroRttStream], limits: ZeroRttStreamLimits,
+) -> QuicResult<()> {
+    let stream_count = u64::try_from(streams.len())
+        .map_err(|_| "too many 0-RTT STREAMs configured")?;
+
+    if stream_count > limits.initial_max_streams_bidi {
+        return Err(format!(
+            "0-RTT STREAM count {stream_count} exceeds peer bidirectional stream limit {}",
+            limits.initial_max_streams_bidi
+        )
+        .into());
+    }
+
+    let mut total_stream_data = 0_u64;
+
+    for (idx, stream) in streams.iter().enumerate() {
+        let stream_id = ConnectionParams::zero_rtt_stream_id(idx)
+            .ok_or("too many 0-RTT STREAMs configured")?;
+        let len = u64::try_from(stream.data.len()).map_err(|_| {
+            format!("0-RTT STREAM {stream_id} payload is too large")
+        })?;
+
+        if len > limits.initial_max_stream_data_bidi_remote {
+            return Err(format!(
+                "0-RTT STREAM {stream_id} payload length {len} exceeds peer stream data limit {}",
+                limits.initial_max_stream_data_bidi_remote
+            )
+            .into());
+        }
+
+        total_stream_data = total_stream_data.checked_add(len).ok_or(
+            "0-RTT STREAM payload lengths exceed the connection data limit",
+        )?;
+
+        if total_stream_data > limits.initial_max_data {
+            return Err(format!(
+                "0-RTT STREAM payload length total {total_stream_data} exceeds peer connection data limit {}",
+                limits.initial_max_data
+            )
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn start_listener<M>(
