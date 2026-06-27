@@ -1045,7 +1045,7 @@ mod tests {
     impl InitialPacketHandler for NoopInitialHandler {
         fn handle_initials(
             &mut self, _incoming: Incoming, _hdr: Header<'static>,
-            _quiche_config: &mut quiche::Config,
+            _quiche_config: &mut Config,
         ) -> io::Result<Option<NewConnection>> {
             Ok(None)
         }
