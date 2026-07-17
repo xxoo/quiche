@@ -50,10 +50,10 @@ async fn test_hello_world_async_callbacks() {
 
     impl ConnectionHook for TestAsyncCallbackConnectionHook {
         fn create_custom_ssl_context_builder(
-            &self, _settings: TlsCertificatePaths<'_>,
-        ) -> Option<SslContextBuilder> {
-            let mut ssl_ctx_builder =
-                SslContextBuilder::new(SslMethod::tls()).ok()?;
+            &self, _settings: Option<TlsCertificatePaths<'_>>,
+            _profile_index: Option<usize>,
+        ) -> tokio_quiche::QuicResult<Option<SslContextBuilder>> {
+            let mut ssl_ctx_builder = SslContextBuilder::new(SslMethod::tls())?;
             ssl_ctx_builder.set_async_select_certificate_callback(|_| {
                 Ok(Box::pin(async {
                     yield_now().await;
@@ -72,7 +72,7 @@ async fn test_hello_world_async_callbacks() {
 
             self.was_called.store(true, Ordering::SeqCst);
 
-            Some(ssl_ctx_builder)
+            Ok(Some(ssl_ctx_builder))
         }
     }
 
@@ -105,10 +105,10 @@ async fn test_async_callbacks_fail_after_initial_send() {
 
     impl ConnectionHook for TestAsyncCallbackConnectionHook {
         fn create_custom_ssl_context_builder(
-            &self, _settings: TlsCertificatePaths<'_>,
-        ) -> Option<SslContextBuilder> {
-            let mut ssl_ctx_builder =
-                SslContextBuilder::new(SslMethod::tls()).ok()?;
+            &self, _settings: Option<TlsCertificatePaths<'_>>,
+            _profile_index: Option<usize>,
+        ) -> tokio_quiche::QuicResult<Option<SslContextBuilder>> {
+            let mut ssl_ctx_builder = SslContextBuilder::new(SslMethod::tls())?;
             ssl_ctx_builder.set_async_select_certificate_callback(|_| {
                 Ok(Box::pin(async {
                     // Async callbacks in tokio quiche are driven by calls to
@@ -134,7 +134,7 @@ async fn test_async_callbacks_fail_after_initial_send() {
                 .set_certificate_chain_file(TEST_CERT_FILE)
                 .unwrap();
 
-            Some(ssl_ctx_builder)
+            Ok(Some(ssl_ctx_builder))
         }
     }
 

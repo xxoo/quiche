@@ -64,10 +64,10 @@ async fn test_handshake_duration_ioworker() {
 
     impl ConnectionHook for TestAsyncCallbackConnectionHook {
         fn create_custom_ssl_context_builder(
-            &self, _settings: TlsCertificatePaths<'_>,
-        ) -> Option<SslContextBuilder> {
-            let mut ssl_ctx_builder =
-                SslContextBuilder::new(SslMethod::tls()).ok()?;
+            &self, _settings: Option<TlsCertificatePaths<'_>>,
+            _profile_index: Option<usize>,
+        ) -> tokio_quiche::QuicResult<Option<SslContextBuilder>> {
+            let mut ssl_ctx_builder = SslContextBuilder::new(SslMethod::tls())?;
             let cloned_bool = Arc::clone(&self.was_called);
 
             ssl_ctx_builder.set_async_select_certificate_callback(move |_| {
@@ -90,7 +90,7 @@ async fn test_handshake_duration_ioworker() {
                 .set_certificate_chain_file(TEST_CERT_FILE)
                 .unwrap();
 
-            Some(ssl_ctx_builder)
+            Ok(Some(ssl_ctx_builder))
         }
     }
 

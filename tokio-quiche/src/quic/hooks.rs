@@ -61,14 +61,18 @@ pub trait ConnectionHook {
     ///
     /// This method allows full customization of quiche's SSL context, for
     /// example to specify async callbacks during the QUIC handshake. It is
-    /// called once for the default profile during initial setup, and once for
-    /// each additional server config profile.
+    /// called once for the default profile during initial setup, with
+    /// `profile_index` set to `None`, and once for each additional server
+    /// config profile, with its zero-based index.
     ///
-    /// Only called if both the hook and [`TlsCertificatePaths`] are set in
-    /// [`ConnectionParams`](crate::ConnectionParams).
+    /// Called whenever the hook is set in
+    /// [`ConnectionParams`](crate::ConnectionParams). The certificate paths are
+    /// `None` when the connection has no local certificate. Returning an error
+    /// aborts configuration instead of falling back to the default TLS builder.
     fn create_custom_ssl_context_builder(
-        &self, settings: TlsCertificatePaths<'_>,
-    ) -> Option<SslContextBuilder>;
+        &self, settings: Option<TlsCertificatePaths<'_>>,
+        profile_index: Option<usize>,
+    ) -> crate::QuicResult<Option<SslContextBuilder>>;
 
     /// Selects a server config profile for an Initial packet.
     ///

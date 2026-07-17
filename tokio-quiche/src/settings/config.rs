@@ -88,6 +88,7 @@ impl Config {
                 quic_settings,
                 params.tls_cert,
                 &params.hooks,
+                None,
                 keylog_file.is_some(),
             )?,
             disable_client_ip_validation: quic_settings
@@ -194,14 +195,14 @@ pub(crate) struct ServerProfileConfig {
 
 fn make_quiche_config_with_settings(
     quic_settings: &QuicSettings, tls_cert: Option<TlsCertificatePaths>,
-    hooks: &Hooks, should_log_keys: bool,
+    hooks: &Hooks, profile_index: Option<usize>, should_log_keys: bool,
 ) -> QuicResult<quiche::Config> {
     let peer_trust_roots = quic_settings.peer_trust_roots.as_ref();
-    let ssl_ctx_builder = hooks
-        .connection_hook
-        .as_ref()
-        .zip(tls_cert)
-        .and_then(|(hook, tls)| hook.create_custom_ssl_context_builder(tls));
+    let ssl_ctx_builder = if let Some(hook) = hooks.connection_hook.as_ref() {
+        hook.create_custom_ssl_context_builder(tls_cert, profile_index)?
+    } else {
+        None
+    };
 
     let mut peer_trust_roots_applied = false;
     let mut config = if let Some(mut builder) = ssl_ctx_builder {
@@ -317,7 +318,9 @@ fn make_server_config_profiles(
 ) -> QuicResult<Vec<ServerProfileConfig>> {
     let mut profiles = Vec::with_capacity(params.server_config_profiles.len());
 
-    for profile in &params.server_config_profiles {
+    for (profile_index, profile) in
+        params.server_config_profiles.iter().enumerate()
+    {
         let mut settings = params.settings.clone();
         profile.apply_to(&mut settings);
 
@@ -328,6 +331,7 @@ fn make_server_config_profiles(
             &settings,
             profile.tls_cert.or(params.tls_cert),
             &params.hooks,
+            Some(profile_index),
             keylog_file.is_some(),
         )?;
         let pacing_offload = make_pacing_offload(&settings, socket_capabilities);
@@ -489,10 +493,20 @@ fn read_file(path: &str) -> QuicResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use crate::quic::ConnectionHook;
+    use crate::settings::CertificateKind;
     use crate::settings::ConnectionParams;
     use crate::settings::ServerConfigOverrides;
+    use crate::settings::TlsCertificatePaths;
     use crate::socket::SocketCapabilities;
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    const TEST_CERT_FILE: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../quiche/examples/cert.crt");
+    const TEST_KEY_FILE: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../quiche/examples/cert.key");
 
     #[test]
     fn server_config_profiles_apply_overrides() {
@@ -548,5 +562,103 @@ mod tests {
             config.server_profile_disable_client_ip_validation(Some(1)),
             None
         );
+    }
+
+    #[test]
+    fn tls_hook_receives_server_profile_index() {
+        struct RecordingHook(Arc<Mutex<Vec<Option<usize>>>>);
+
+        impl ConnectionHook for RecordingHook {
+            fn create_custom_ssl_context_builder(
+                &self, _settings: Option<TlsCertificatePaths<'_>>,
+                profile_index: Option<usize>,
+            ) -> crate::QuicResult<Option<boring::ssl::SslContextBuilder>>
+            {
+                self.0.lock().unwrap().push(profile_index);
+                Ok(None)
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut params = ConnectionParams::default();
+        params.tls_cert = Some(TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: CertificateKind::X509,
+        });
+        params.hooks.connection_hook =
+            Some(Arc::new(RecordingHook(Arc::clone(&calls))));
+        params
+            .server_config_profiles
+            .resize_with(2, ServerConfigOverrides::default);
+
+        Config::new(&params, SocketCapabilities::default()).unwrap();
+
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(calls, vec![None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn tls_hook_error_never_falls_back() {
+        struct FailingHook;
+
+        impl ConnectionHook for FailingHook {
+            fn create_custom_ssl_context_builder(
+                &self, _settings: Option<TlsCertificatePaths<'_>>,
+                _profile_index: Option<usize>,
+            ) -> crate::QuicResult<Option<boring::ssl::SslContextBuilder>>
+            {
+                Err("sentinel TLS hook failure".into())
+            }
+        }
+
+        let mut params = ConnectionParams::default();
+        params.hooks.connection_hook = Some(Arc::new(FailingHook));
+
+        let error = Config::new(&params, SocketCapabilities::default())
+            .err()
+            .expect("TLS hook error must abort config construction");
+        assert_eq!(error.to_string(), "sentinel TLS hook failure");
+    }
+
+    #[test]
+    fn tls_hook_without_certificate_can_customize_or_fall_back() {
+        struct NoCertificateHook(Arc<Mutex<Vec<(Option<usize>, bool)>>>);
+
+        impl ConnectionHook for NoCertificateHook {
+            fn create_custom_ssl_context_builder(
+                &self, settings: Option<TlsCertificatePaths<'_>>,
+                profile_index: Option<usize>,
+            ) -> crate::QuicResult<Option<boring::ssl::SslContextBuilder>>
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((profile_index, settings.is_none()));
+
+                if profile_index.is_none() {
+                    Ok(Some(boring::ssl::SslContextBuilder::new(
+                        boring::ssl::SslMethod::tls(),
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut params = ConnectionParams::default();
+        params.hooks.connection_hook =
+            Some(Arc::new(NoCertificateHook(Arc::clone(&calls))));
+        params
+            .server_config_profiles
+            .push(ServerConfigOverrides::default());
+
+        Config::new(&params, SocketCapabilities::default()).unwrap();
+
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(calls, vec![(None, true), (Some(0), true)]);
     }
 }
