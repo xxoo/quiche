@@ -127,6 +127,7 @@ where
             profile_index,
             incoming.peer_addr.ip(),
             handshake_start_time,
+            config.server_config_identity.clone(),
         ));
         let scid = self.cid_generator.new_connection_id();
 

@@ -75,6 +75,7 @@ use crate::quic::io::worker::IoWorker;
 use crate::quic::io::worker::WriterConfig;
 use crate::quic::io::worker::INCOMING_QUEUE_SIZE;
 use crate::quic::router::ConnectionMapCommand;
+use crate::settings::ServerConfigIdentity;
 use crate::socket::MigratableUdpSocket;
 use crate::QuicResult;
 
@@ -91,6 +92,7 @@ pub struct ServerInitialMetadata {
     profile_index: Option<usize>,
     canonical_source: IpAddr,
     handshake_start: Instant,
+    server_config_identity: ServerConfigIdentity,
 }
 
 impl fmt::Debug for ServerInitialMetadata {
@@ -104,11 +106,13 @@ impl fmt::Debug for ServerInitialMetadata {
 impl ServerInitialMetadata {
     pub(crate) fn new(
         profile_index: Option<usize>, source: IpAddr, handshake_start: Instant,
+        server_config_identity: ServerConfigIdentity,
     ) -> Self {
         Self {
             profile_index,
             canonical_source: source.to_canonical(),
             handshake_start,
+            server_config_identity,
         }
     }
 
@@ -125,6 +129,12 @@ impl ServerInitialMetadata {
     /// The instant immediately before the server connection was created.
     pub fn handshake_start(&self) -> Instant {
         self.handshake_start
+    }
+
+    /// Returns whether this Initial was accepted by the identified server
+    /// config.
+    pub fn belongs_to(&self, identity: &ServerConfigIdentity) -> bool {
+        self.server_config_identity.same_config(identity)
     }
 }
 
@@ -1122,10 +1132,15 @@ mod tests {
     #[test]
     fn server_initial_metadata_canonicalizes_source_and_preserves_time() {
         let start = Instant::now();
+        let identity =
+            crate::ConnectionParams::default().server_config_identity();
+        let other_identity =
+            crate::ConnectionParams::default().server_config_identity();
         let metadata = ServerInitialMetadata::new(
             Some(2),
             "::ffff:192.0.2.1".parse().unwrap(),
             start,
+            identity.clone(),
         );
 
         assert_eq!(metadata.profile_index(), Some(2));
@@ -1134,7 +1149,10 @@ mod tests {
             "192.0.2.1".parse::<IpAddr>().unwrap()
         );
         assert_eq!(metadata.handshake_start(), start);
+        assert!(metadata.belongs_to(&identity));
+        assert!(!metadata.belongs_to(&other_identity));
         assert_eq!(format!("{metadata:?}"), "ServerInitialMetadata { .. }");
+        assert_eq!(format!("{identity:?}"), "ServerConfigIdentity { .. }");
     }
 
     #[test]
