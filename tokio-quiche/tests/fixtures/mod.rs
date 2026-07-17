@@ -103,10 +103,11 @@ impl TestConnectionHook {
 
 impl ConnectionHook for TestConnectionHook {
     fn create_custom_ssl_context_builder(
-        &self, _settings: TlsCertificatePaths<'_>,
-    ) -> Option<boring::ssl::SslContextBuilder> {
+        &self, _settings: Option<TlsCertificatePaths<'_>>,
+        _profile_index: Option<usize>,
+    ) -> tokio_quiche::QuicResult<Option<boring::ssl::SslContextBuilder>> {
         self.was_called.store(true, Ordering::SeqCst);
-        None
+        Ok(None)
     }
 }
 
