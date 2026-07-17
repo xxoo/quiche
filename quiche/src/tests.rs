@@ -614,6 +614,47 @@ fn handshake_resumption(
     assert!(pipe.server.is_resumed());
 }
 
+#[test]
+fn early_data_accepted_verdicts() {
+    const SESSION_TICKET_KEY: [u8; 48] = [0xb; 48];
+
+    let mut accepting = test_utils::Pipe::default_config("cubic").unwrap();
+    accepting.set_ticket_key(&SESSION_TICKET_KEY).unwrap();
+    accepting.enable_early_data();
+
+    let mut initial = test_utils::Pipe::with_config(&mut accepting).unwrap();
+    assert_eq!(initial.handshake(), Ok(()));
+    assert!(!initial.client.early_data_accepted());
+    assert!(!initial.server.early_data_accepted());
+    let session = initial.client.session().unwrap().to_vec();
+
+    let mut accepted = test_utils::Pipe::with_config(&mut accepting).unwrap();
+    assert_eq!(accepted.client.set_session(&session), Ok(()));
+    assert_eq!(accepted.handshake(), Ok(()));
+    assert!(accepted.client.is_resumed());
+    assert!(accepted.server.is_resumed());
+    assert!(accepted.client.early_data_accepted());
+    assert!(accepted.server.early_data_accepted());
+
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    client.enable_early_data();
+    let mut rejecting_server = test_utils::Pipe::default_config("cubic").unwrap();
+    rejecting_server
+        .set_ticket_key(&SESSION_TICKET_KEY)
+        .unwrap();
+    let mut rejected = test_utils::Pipe::with_client_and_server_config(
+        &mut client,
+        &mut rejecting_server,
+    )
+    .unwrap();
+    assert_eq!(rejected.client.set_session(&session), Ok(()));
+    assert_eq!(rejected.handshake(), Ok(()));
+    assert!(rejected.client.is_resumed());
+    assert!(rejected.server.is_resumed());
+    assert!(!rejected.client.early_data_accepted());
+    assert!(!rejected.server.early_data_accepted());
+}
+
 #[rstest]
 fn handshake_alpn_mismatch(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

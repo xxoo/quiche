@@ -7725,6 +7725,17 @@ impl<F: BufFactory> Connection<F> {
         self.handshake.is_in_early_data()
     }
 
+    /// Returns whether TLS accepted early data for the current handshake.
+    ///
+    /// Callers that need a final handshake verdict must wait until
+    /// [`is_established()`] is true before using this value.
+    ///
+    /// [`is_established()`]: Self::is_established
+    #[inline]
+    pub fn early_data_accepted(&self) -> bool {
+        self.handshake.early_data_accepted()
+    }
+
     /// Returns the early data reason for the connection.
     ///
     /// This status can be useful for logging and debugging. See [BoringSSL]

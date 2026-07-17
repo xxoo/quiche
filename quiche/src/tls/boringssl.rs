@@ -275,6 +275,10 @@ impl Handshake {
         unsafe { SSL_in_early_data(self.as_ptr()) == 1 }
     }
 
+    pub fn early_data_accepted(&self) -> bool {
+        unsafe { SSL_early_data_accepted(self.as_ptr()) == 1 }
+    }
+
     pub fn early_data_reason(&self) -> u32 {
         let reuse_reason_status =
             unsafe { SSL_get_early_data_reason(self.as_ptr()) };
@@ -350,6 +354,8 @@ extern "C" {
     fn SSL_reset_early_data_reject(ssl: *mut SSL);
 
     fn SSL_in_early_data(ssl: *const SSL) -> c_int;
+
+    fn SSL_early_data_accepted(ssl: *const SSL) -> c_int;
 
     fn SSL_get_early_data_reason(ssl: *const SSL) -> ssl_early_data_reason_t;
 
