@@ -70,6 +70,7 @@ use quiche::Error as QuicheError;
 use quiche::SendInfo;
 use tokio::select;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time;
 
 // Number of incoming packets to be buffered in the incoming channel.
@@ -217,7 +218,14 @@ where
         }
     }
 
-    fn fill_available_scids(&mut self, qconn: &mut QuicheConnection) {
+    async fn fill_available_scids(&mut self, qconn: &mut QuicheConnection) {
+        self.fill_available_scids_with(qconn, random_u128).await;
+    }
+
+    async fn fill_available_scids_with(
+        &mut self, qconn: &mut QuicheConnection,
+        mut next_reset_token: impl FnMut() -> u128,
+    ) {
         if qconn.scids_left() == 0 {
             return;
         }
@@ -235,28 +243,59 @@ where
         let current_cid = qconn.source_id().into_owned();
         for _ in 0..qconn.scids_left() {
             // We don't emit stateless resets, so any unguessable value is fine
-            let reset_token = random_u128();
+            let reset_token = next_reset_token();
             let new_cid = cid_generator.new_connection_id();
-
-            if qconn.new_scid(&new_cid, reset_token, false).is_err() {
-                // This only fails if we have reached the CID limit already
-                return;
+            let (result_tx, result_rx) = oneshot::channel();
+            let newly_tracked =
+                self.route_cleanup.as_mut().is_some_and(|route_cleanup| {
+                    route_cleanup.track(new_cid.clone())
+                });
+            if !newly_tracked {
+                // The generator repeated one of this owner's live CIDs.
+                continue;
             }
-
+            // Tracking before the asynchronous command makes cancellation
+            // enqueue an owner-scoped unmap after the map command.
             if self
                 .conn_map_cmd_tx
                 .send(ConnectionMapCommand::MapCid {
                     owner: owner.clone(),
                     existing_cid: current_cid.clone(),
                     new_cid: new_cid.clone(),
+                    result: result_tx,
                 })
                 .is_err()
             {
-                // Can't do anything if the connection map is gone
+                if let Some(route_cleanup) = &mut self.route_cleanup {
+                    route_cleanup.forget(&new_cid);
+                }
+                // The connection map is gone, so no new CID can be routed.
                 return;
             }
-            if let Some(route_cleanup) = &mut self.route_cleanup {
-                route_cleanup.track(new_cid);
+
+            match result_rx.await {
+                Ok(true) => {},
+                Ok(false) => {
+                    if let Some(route_cleanup) = &mut self.route_cleanup {
+                        route_cleanup.forget(&new_cid);
+                    }
+                    continue;
+                },
+                Err(_) => {
+                    // Router shutdown drops the entire map. No mapping remains
+                    // to clean, and the CID was never added to quiche.
+                    if let Some(route_cleanup) = &mut self.route_cleanup {
+                        route_cleanup.forget(&new_cid);
+                    }
+                    return;
+                },
+            }
+
+            if qconn.new_scid(&new_cid, reset_token, false).is_err() {
+                // The route was confirmed first. Roll it back when quiche no
+                // longer has capacity or rejects the generated CID.
+                self.unmap_cid(new_cid);
+                return;
             }
         }
     }
@@ -275,9 +314,9 @@ where
             .send(ConnectionMapCommand::UnmapCid { cid, owner });
     }
 
-    fn refresh_connection_ids(&mut self, qconn: &mut QuicheConnection) {
+    async fn refresh_connection_ids(&mut self, qconn: &mut QuicheConnection) {
         // Top up the connection's active CIDs
-        self.fill_available_scids(qconn);
+        self.fill_available_scids(qconn).await;
 
         // Remove retired CIDs from the ingress router
         while let Some(retired_cid) = qconn.retired_scid_next() {
@@ -403,7 +442,7 @@ where
                 }
 
                 self.conn_stage.on_read(did_recv, qconn, ctx)?;
-                self.refresh_connection_ids(qconn);
+                self.refresh_connection_ids(qconn).await;
 
                 let can_release = match self.write_state.next_release_time {
                     None => true,
@@ -1237,12 +1276,123 @@ fn random_u128() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::DefaultMetrics;
+    use crate::ConnectionIdGenerator;
     use quiche::test_utils::emit_flight;
     use quiche::test_utils::process_flight;
     use quiche::test_utils::Pipe;
+    use std::collections::VecDeque;
+    use std::future::Future as _;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
+    use std::sync::Mutex;
+
+    struct NoopDatagramSender;
+
+    impl DatagramSocketSend for NoopDatagramSender {
+        fn poll_send(
+            &self, _cx: &mut std::task::Context, buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_send_to(
+            &self, _cx: &mut std::task::Context, buf: &[u8], _addr: SocketAddr,
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestStage;
+
+    impl ConnectionStage for TestStage {}
+
+    struct SequenceCidGenerator {
+        ids: Mutex<VecDeque<ConnectionId<'static>>>,
+        fallback: ConnectionId<'static>,
+    }
+
+    impl ConnectionIdGenerator<'static> for SequenceCidGenerator {
+        fn new_connection_id(&self) -> ConnectionId<'static> {
+            self.ids
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.fallback.clone())
+        }
+
+        fn verify_connection_id(
+            &self, _cid: &ConnectionId<'_>,
+        ) -> QuicResult<()> {
+            Ok(())
+        }
+    }
+
+    fn cid_test_worker(
+        current_cid: ConnectionId<'static>, generated: ConnectionId<'static>,
+    ) -> (
+        IoWorker<NoopDatagramSender, DefaultMetrics, TestStage>,
+        mpsc::UnboundedReceiver<ConnectionMapCommand>,
+    ) {
+        let (conn_map_cmd_tx, conn_map_cmd_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let owner = crate::quic::connection::RouteOwner::new();
+        let route_cleanup = RouteCleanupGuard::new(
+            conn_map_cmd_tx.clone(),
+            owner,
+            current_cid.clone(),
+            None,
+        );
+        let local_addr = "127.0.0.1:443".parse().unwrap();
+        let peer_addr = "127.0.0.1:1234".parse().unwrap();
+        let params = IoWorkerParams {
+            socket: MaybeConnectedSocket::new(NoopDatagramSender),
+            shutdown_tx,
+            cfg: WriterConfig {
+                pending_cid: None,
+                peer_addr,
+                local_addr,
+                with_gso: false,
+                pacing_offload: false,
+                with_pktinfo: false,
+                fixed_peer_ip: None,
+            },
+            audit_log_stats: Arc::new(QuicAuditStats::new(current_cid.to_vec())),
+            write_state: WriteState::default(),
+            conn_map_cmd_tx,
+            route_cleanup: Some(route_cleanup),
+            cid_generator: Some(Arc::new(SequenceCidGenerator {
+                ids: Mutex::new(VecDeque::from([generated])),
+                fallback: current_cid,
+            })),
+            client_migration_rx: None,
+            client_migration_socket: None,
+            endpoint_state: ConnectionEndpointState::new(local_addr, peer_addr),
+            #[cfg(feature = "perf-quic-listener-metrics")]
+            init_rx_time: None,
+            metrics: DefaultMetrics,
+        };
+        (IoWorker::new(params, TestStage), conn_map_cmd_rx)
+    }
+
+    fn take_map_result(
+        commands: &mut mpsc::UnboundedReceiver<ConnectionMapCommand>,
+        expected_cid: &ConnectionId<'_>,
+    ) -> oneshot::Sender<bool> {
+        match commands.try_recv().unwrap() {
+            ConnectionMapCommand::MapCid {
+                new_cid, result, ..
+            } => {
+                assert_eq!(new_cid, *expected_cid);
+                result
+            },
+            ConnectionMapCommand::UnmapCid { .. } => {
+                panic!("expected a route-map confirmation request")
+            },
+        }
+    }
 
     fn test_config(server: bool) -> quiche::Config {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -1265,6 +1415,7 @@ mod tests {
         config.set_initial_max_stream_data_bidi_local(64);
         config.set_initial_max_stream_data_bidi_remote(64);
         config.set_initial_max_streams_bidi(1);
+        config.set_active_connection_id_limit(4);
         config.verify_peer(false);
         config
     }
@@ -1292,6 +1443,175 @@ mod tests {
             &mut server_config,
         )
         .unwrap()
+    }
+
+    fn source_ids(connection: &QuicheConnection) -> Vec<Vec<u8>> {
+        connection.source_ids().map(|cid| cid.to_vec()).collect()
+    }
+
+    #[tokio::test]
+    async fn dynamic_scid_is_not_added_before_route_confirmation() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.scids_left() > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0xa5; 20]);
+        let before = source_ids(&pipe.server);
+        let (mut worker, mut commands) =
+            cid_test_worker(current_cid, generated.clone());
+        let mut fill = Box::pin(worker.fill_available_scids(&mut pipe.server));
+        let mut context =
+            std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(fill.as_mut().poll(&mut context).is_pending());
+        let result = take_map_result(&mut commands, &generated);
+        drop(fill);
+        drop(result);
+
+        assert_eq!(source_ids(&pipe.server), before);
+        assert!(worker.route_cleanup.as_ref().unwrap().tracks(&generated));
+        drop(worker);
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok()).any(|command| {
+                matches!(
+                    command,
+                    ConnectionMapCommand::UnmapCid { cid, .. } if cid == generated
+                )
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_scid_collision_leaves_quiche_and_cleanup_unchanged() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.scids_left() > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0x5a; 20]);
+        let before = source_ids(&pipe.server);
+        let (mut worker, mut commands) =
+            cid_test_worker(current_cid.clone(), generated.clone());
+        let mut fill = Box::pin(worker.fill_available_scids(&mut pipe.server));
+        let mut context =
+            std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(fill.as_mut().poll(&mut context).is_pending());
+        take_map_result(&mut commands, &generated)
+            .send(false)
+            .unwrap();
+        assert!(fill.as_mut().poll(&mut context).is_ready());
+        drop(fill);
+
+        assert_eq!(source_ids(&pipe.server), before);
+        let cleanup = worker.route_cleanup.as_ref().unwrap();
+        assert!(cleanup.tracks(&current_cid));
+        assert!(!cleanup.tracks(&generated));
+    }
+
+    #[tokio::test]
+    async fn dynamic_scid_is_added_only_after_route_confirmation() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.scids_left() > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0x3c; 20]);
+        let before = source_ids(&pipe.server);
+        let (mut worker, mut commands) =
+            cid_test_worker(current_cid, generated.clone());
+        let mut fill = Box::pin(worker.fill_available_scids(&mut pipe.server));
+        let mut context =
+            std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(fill.as_mut().poll(&mut context).is_pending());
+        take_map_result(&mut commands, &generated)
+            .send(true)
+            .unwrap();
+        assert!(fill.as_mut().poll(&mut context).is_ready());
+        drop(fill);
+
+        let after = source_ids(&pipe.server);
+        assert_eq!(after.len(), before.len() + 1);
+        assert!(after.contains(&generated.to_vec()));
+        assert!(worker.route_cleanup.as_ref().unwrap().tracks(&generated));
+    }
+
+    #[tokio::test]
+    async fn repeated_live_scid_is_skipped_without_forgetting_cleanup() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.scids_left() > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let before = source_ids(&pipe.server);
+        let (mut worker, mut commands) =
+            cid_test_worker(current_cid.clone(), current_cid.clone());
+        worker.fill_available_scids(&mut pipe.server).await;
+
+        assert_eq!(source_ids(&pipe.server), before);
+        assert!(commands.try_recv().is_err());
+        assert!(worker.route_cleanup.as_ref().unwrap().tracks(&current_cid));
+    }
+
+    #[tokio::test]
+    async fn quiche_scid_rejection_rolls_back_confirmed_route() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.scids_left() > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let invalid = ConnectionId::from_vec(vec![0x7e; 20]);
+        pipe.server.new_scid(&invalid, 7, false).unwrap();
+        assert!(pipe.server.scids_left() > 0);
+        let before = source_ids(&pipe.server);
+        let (mut worker, mut commands) =
+            cid_test_worker(current_cid.clone(), invalid.clone());
+        let mut fill =
+            Box::pin(worker.fill_available_scids_with(&mut pipe.server, || 8));
+        let mut context =
+            std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(fill.as_mut().poll(&mut context).is_pending());
+        take_map_result(&mut commands, &invalid).send(true).unwrap();
+        assert!(fill.as_mut().poll(&mut context).is_ready());
+        drop(fill);
+
+        assert_eq!(source_ids(&pipe.server), before);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ConnectionMapCommand::UnmapCid { cid, .. }) if cid == invalid
+        ));
+        let cleanup = worker.route_cleanup.as_ref().unwrap();
+        assert!(cleanup.tracks(&current_cid));
+        assert!(!cleanup.tracks(&invalid));
+    }
+
+    #[tokio::test]
+    async fn closed_router_never_adds_or_tracks_dynamic_scid() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert!(pipe.server.scids_left() > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0x66; 20]);
+        let before = source_ids(&pipe.server);
+        let (mut worker, commands) =
+            cid_test_worker(current_cid.clone(), generated.clone());
+        drop(commands);
+        worker.fill_available_scids(&mut pipe.server).await;
+
+        assert_eq!(source_ids(&pipe.server), before);
+        let cleanup = worker.route_cleanup.as_ref().unwrap();
+        assert!(cleanup.tracks(&current_cid));
+        assert!(!cleanup.tracks(&generated));
     }
 
     #[derive(Debug, Eq, PartialEq)]

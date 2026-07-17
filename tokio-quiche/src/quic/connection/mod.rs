@@ -172,14 +172,22 @@ impl RouteCleanupGuard {
         &self.owner
     }
 
-    pub(crate) fn track(&mut self, cid: ConnectionId<'static>) {
+    pub(crate) fn track(&mut self, cid: ConnectionId<'static>) -> bool {
         if !self.cids.contains(&cid) {
             self.cids.push(cid);
+            true
+        } else {
+            false
         }
     }
 
     pub(crate) fn forget(&mut self, cid: &ConnectionId<'_>) {
         self.cids.retain(|owned| owned != cid);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracks(&self, cid: &ConnectionId<'_>) -> bool {
+        self.cids.contains(cid)
     }
 }
 
@@ -462,6 +470,11 @@ where
 
     pub(crate) fn fixed_peer_ip(&self) -> Option<IpAddr> {
         self.params.writer_cfg.fixed_peer_ip
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_cid(&self) -> Option<&ConnectionId<'static>> {
+        self.params.writer_cfg.pending_cid.as_ref()
     }
 
     /// [boring]'s SSL object for this connection.
@@ -1137,7 +1150,7 @@ mod tests {
             scid.clone(),
             Some(pending_cid.clone()),
         );
-        cleanup.track(dynamic_cid.clone());
+        assert!(cleanup.track(dynamic_cid.clone()));
         drop(cleanup);
 
         assert!(matches!(

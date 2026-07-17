@@ -66,6 +66,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use task_killswitch::spawn_with_killswitch;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 #[cfg(target_os = "linux")]
 use foundations::telemetry::metrics::Counter;
@@ -132,6 +133,7 @@ pub(crate) enum ConnectionMapCommand {
         owner: RouteOwner,
         existing_cid: ConnectionId<'static>,
         new_cid: ConnectionId<'static>,
+        result: oneshot::Sender<bool>,
     },
     UnmapCid {
         cid: ConnectionId<'static>,
@@ -397,6 +399,11 @@ where
         };
 
         let scid = conn.source_id().into_owned();
+        // A server CID can equal the client's pending CID when a custom CID
+        // generator deliberately reuses the Initial DCID. Own that route once:
+        // otherwise the worker would later retire the live server CID as the
+        // temporary pending route when the handshake becomes established.
+        let pending_cid = pending_cid.filter(|pending| pending != &scid);
         let route_owner = RouteOwner::new();
         let route_cleanup = Some(RouteCleanupGuard::new(
             self.conn_map_cmd_tx.clone(),
@@ -832,9 +839,11 @@ where
                         owner,
                         existing_cid,
                         new_cid,
+                        result,
                     } => {
-                        let _ =
+                        let mapped =
                             self.conns.map_cid(&owner, &existing_cid, &new_cid);
+                        let _ = result.send(mapped);
                     },
                     ConnectionMapCommand::UnmapCid { cid, owner } => {
                         if let Some(owner) = owner {
@@ -1269,6 +1278,81 @@ mod tests {
         let (written, _) = connection.send(&mut packet).unwrap();
         packet.truncate(written);
         packet
+    }
+
+    struct FixedConnectionIdGenerator(ConnectionId<'static>);
+
+    impl crate::ConnectionIdGenerator<'static> for FixedConnectionIdGenerator {
+        fn new_connection_id(&self) -> ConnectionId<'static> {
+            self.0.clone()
+        }
+
+        fn verify_connection_id(
+            &self, _cid: &ConnectionId<'_>,
+        ) -> QuicResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_pending_and_server_cid_is_owned_once() {
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+        let packet = client_initial_packet(client_addr, server_addr);
+        let mut parsed_packet = packet.clone();
+        let pending_cid = Header::from_slice(&mut parsed_packet, MAX_CONN_ID_LEN)
+            .unwrap()
+            .dcid
+            .into_owned();
+
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        let socket = Arc::new(NoopDatagramSender);
+        let acceptor = ConnectionAcceptor::new(
+            ConnectionAcceptorConfig {
+                connection_hook: None,
+                #[cfg(target_os = "linux")]
+                with_pktinfo: false,
+            },
+            Arc::clone(&socket),
+            Default::default(),
+            Arc::new(FixedConnectionIdGenerator(pending_cid.clone())),
+            DefaultMetrics,
+        );
+        let (mut router, mut accepted) = InboundPacketRouter::new(
+            config,
+            socket,
+            AlwaysReadyReceiver,
+            server_addr,
+            acceptor,
+            DefaultMetrics,
+        );
+
+        router
+            .on_incoming(Incoming {
+                peer_addr: client_addr,
+                local_addr: server_addr,
+                rx_time: None,
+                buf: packet,
+                gro: None,
+                #[cfg(target_os = "linux")]
+                so_mark_data: None,
+            })
+            .unwrap();
+        let initial = accepted.try_recv().unwrap().unwrap();
+
+        assert!(initial.pending_cid().is_none());
+        assert_eq!(router.conns.len(), 1);
+        assert!(router.conns.get(&pending_cid).is_some());
     }
 
     #[tokio::test]
