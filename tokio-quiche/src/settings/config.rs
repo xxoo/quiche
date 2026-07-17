@@ -37,6 +37,7 @@ use crate::settings::ConnectionParams;
 use crate::settings::Hooks;
 use crate::settings::PeerTrustRoots;
 use crate::settings::QuicSettings;
+use crate::settings::ServerConfigIdentity;
 use crate::settings::TlsCertificatePaths;
 use crate::socket::SocketCapabilities;
 
@@ -59,6 +60,7 @@ pub(crate) struct Config {
     pub handshake_timeout: Option<Duration>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
+    pub(crate) server_config_identity: ServerConfigIdentity,
     server_config_profiles: Vec<ServerProfileConfig>,
 }
 
@@ -104,6 +106,7 @@ impl Config {
             handshake_timeout: quic_settings.handshake_timeout,
             has_ippktinfo,
             has_ipv6pktinfo,
+            server_config_identity: params.server_config_identity(),
             server_config_profiles,
         })
     }

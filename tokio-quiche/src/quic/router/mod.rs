@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_initial_removes_pending_route_before_reaccept() {
+    async fn rejected_initial_preserves_config_identity_and_reaccepts() {
         let tls_cert_settings = TlsCertificatePaths {
             cert: TEST_CERT_FILE,
             private_key: TEST_KEY_FILE,
@@ -1367,6 +1367,21 @@ mod tests {
             tls_cert_settings,
             Hooks::default(),
         );
+        let identity_a = params.server_config_identity();
+        let identity_b = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        )
+        .server_config_identity();
+        let sibling_config =
+            Config::new(&params, SocketCapabilities::default()).unwrap();
+        assert!(sibling_config
+            .server_config_identity
+            .same_config(&identity_a));
+        assert!(!sibling_config
+            .server_config_identity
+            .same_config(&identity_b));
         let config = Config::new(&params, SocketCapabilities::default()).unwrap();
         let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server_socket.local_addr().unwrap();
@@ -1398,14 +1413,17 @@ mod tests {
             server_addr,
         );
         client_socket.send_to(&packet, server_addr).await.unwrap();
-        let first = time::timeout(Duration::from_secs(1), incoming.recv())
+        let mut first = time::timeout(Duration::from_secs(1), incoming.recv())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+        let metadata = first.take_server_initial_metadata().unwrap();
+        assert!(metadata.belongs_to(&identity_a));
+        assert!(!metadata.belongs_to(&identity_b));
         first.reject();
 
-        let second = time::timeout(Duration::from_secs(1), async {
+        let mut second = time::timeout(Duration::from_secs(1), async {
             loop {
                 client_socket.send_to(&packet, server_addr).await.unwrap();
                 if let Ok(Some(accepted)) =
@@ -1418,6 +1436,9 @@ mod tests {
         })
         .await
         .unwrap();
+        let metadata = second.take_server_initial_metadata().unwrap();
+        assert!(metadata.belongs_to(&identity_a));
+        assert!(!metadata.belongs_to(&identity_b));
         second.reject();
     }
 

@@ -39,6 +39,8 @@ pub use self::overrides::*;
 pub use self::quic::*;
 pub use self::tls::*;
 
+use std::sync::Arc;
+
 /// Combined configuration parameters required to establish a QUIC connection.
 ///
 /// [`ConnectionParams`] aggregates the parameters required for all QUIC
@@ -46,7 +48,6 @@ pub use self::tls::*;
 /// To construct them, either `ConnectionParams::new_server` or
 /// `ConnectionParams::new_client` must be used. The parameters can be modified
 /// freely after construction.
-#[derive(Default)]
 #[non_exhaustive] // force use of constructor functions
 pub struct ConnectionParams<'a> {
     /// QUIC connection settings.
@@ -84,6 +85,7 @@ pub struct ConnectionParams<'a> {
     ///
     /// [`connect_with_config()`]: crate::quic::connect_with_config
     pub zero_rtt_streams: Vec<ZeroRttStream>,
+    server_config_identity: ServerConfigIdentity,
     /// Custom destination connection ID to use for client connections.
     ///
     /// Be aware that [RFC 9000] places requirements for unpredictability and
@@ -95,6 +97,23 @@ pub struct ConnectionParams<'a> {
     /// [RFC 9000]: <https://datatracker.ietf.org/doc/html/rfc9000#section-7.2-3>
     #[cfg(feature = "custom-client-dcid")]
     pub dcid: Option<quiche::ConnectionId<'static>>,
+}
+
+impl<'a> Default for ConnectionParams<'a> {
+    fn default() -> Self {
+        Self {
+            settings: QuicSettings::default(),
+            tls_cert: None,
+            hooks: Hooks::default(),
+            server_config_profiles: Vec::new(),
+            session: None,
+            zero_rtt_dgrams: Vec::new(),
+            zero_rtt_streams: Vec::new(),
+            server_config_identity: ServerConfigIdentity::new(),
+            #[cfg(feature = "custom-client-dcid")]
+            dcid: None,
+        }
+    }
 }
 
 impl core::fmt::Debug for ConnectionParams<'_> {
@@ -128,6 +147,7 @@ impl<'a> ConnectionParams<'a> {
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
+            server_config_identity: ServerConfigIdentity::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }
@@ -148,9 +168,16 @@ impl<'a> ConnectionParams<'a> {
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
+            server_config_identity: ServerConfigIdentity::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
         }
+    }
+
+    /// Returns the opaque identity shared by server configs built from these
+    /// parameters.
+    pub fn server_config_identity(&self) -> ServerConfigIdentity {
+        self.server_config_identity.clone()
     }
 
     /// Returns the stream ID used for the configured 0-RTT stream at `index`.
@@ -167,6 +194,28 @@ impl<'a> ConnectionParams<'a> {
         }
 
         Some(index << 2)
+    }
+}
+
+/// Opaque identity of the [`ConnectionParams`] that produced a server config.
+#[derive(Clone)]
+pub struct ServerConfigIdentity(Arc<()>);
+
+impl ServerConfigIdentity {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    pub(crate) fn same_config(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl core::fmt::Debug for ServerConfigIdentity {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ServerConfigIdentity")
+            .finish_non_exhaustive()
     }
 }
 
