@@ -78,6 +78,122 @@ use crate::quic::router::ConnectionMapCommand;
 use crate::socket::MigratableUdpSocket;
 use crate::QuicResult;
 
+/// Frozen server-side classification for an accepted Initial packet.
+///
+/// This value is bound to an [`InitialQuicConnection`], can only be taken once,
+/// and intentionally does not implement `Clone` or expose a constructor.
+///
+/// ```compile_fail
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<tokio_quiche::quic::ServerInitialMetadata>();
+/// ```
+pub struct ServerInitialMetadata {
+    profile_index: Option<usize>,
+    canonical_source: IpAddr,
+    handshake_start: Instant,
+}
+
+impl fmt::Debug for ServerInitialMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerInitialMetadata")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerInitialMetadata {
+    pub(crate) fn new(
+        profile_index: Option<usize>, source: IpAddr, handshake_start: Instant,
+    ) -> Self {
+        Self {
+            profile_index,
+            canonical_source: source.to_canonical(),
+            handshake_start,
+        }
+    }
+
+    /// The server config profile selected for this Initial.
+    pub fn profile_index(&self) -> Option<usize> {
+        self.profile_index
+    }
+
+    /// The canonical source IP from this Initial.
+    pub fn canonical_source(&self) -> IpAddr {
+        self.canonical_source
+    }
+
+    /// The instant immediately before the server connection was created.
+    pub fn handshake_start(&self) -> Instant {
+        self.handshake_start
+    }
+}
+
+/// Unforgeable identity for one ingress-router connection owner.
+#[derive(Clone)]
+pub(crate) struct RouteOwner(Arc<()>);
+
+impl RouteOwner {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Removes tracked router mappings when their connection owner is dropped.
+pub(crate) struct RouteCleanupGuard {
+    command_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
+    owner: RouteOwner,
+    cids: Vec<ConnectionId<'static>>,
+}
+
+impl RouteCleanupGuard {
+    pub(crate) fn new(
+        command_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
+        owner: RouteOwner, scid: ConnectionId<'static>,
+        pending_cid: Option<ConnectionId<'static>>,
+    ) -> Self {
+        let mut cids = vec![scid];
+        if let Some(pending_cid) = pending_cid {
+            if !cids.contains(&pending_cid) {
+                cids.push(pending_cid);
+            }
+        }
+        Self {
+            command_tx,
+            owner,
+            cids,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &RouteOwner {
+        &self.owner
+    }
+
+    pub(crate) fn track(&mut self, cid: ConnectionId<'static>) {
+        if !self.cids.contains(&cid) {
+            self.cids.push(cid);
+        }
+    }
+
+    pub(crate) fn forget(&mut self, cid: &ConnectionId<'_>) {
+        self.cids.retain(|owned| owned != cid);
+    }
+}
+
+impl Drop for RouteCleanupGuard {
+    fn drop(&mut self) {
+        for cid in self.cids.drain(..) {
+            let _ = self.command_tx.send(ConnectionMapCommand::UnmapCid {
+                cid,
+                owner: Some(self.owner.clone()),
+            });
+        }
+    }
+}
+
 /// Wrapper for connection statistics recorded by [quiche].
 #[derive(Debug)]
 pub struct QuicConnectionStats {
@@ -328,6 +444,22 @@ where
         self.endpoint_state.peer_addr()
     }
 
+    /// Takes the frozen server Initial classification exactly once.
+    ///
+    /// Client connections and connections created with the raw wrapper return
+    /// `None`.
+    pub fn take_server_initial_metadata(
+        &mut self,
+    ) -> Option<ServerInitialMetadata> {
+        self.params.server_initial_metadata.take()
+    }
+
+    /// Rejects this connection before its I/O worker starts.
+    ///
+    /// Dropping the consumed owner releases its initial ingress-router
+    /// mappings.
+    pub fn reject(self) {}
+
     pub(crate) fn fixed_peer_ip(&self) -> Option<IpAddr> {
         self.params.writer_cfg.fixed_peer_ip
     }
@@ -397,6 +529,7 @@ where
             audit_log_stats: self.audit_log_stats,
             write_state: WriteState::default(),
             conn_map_cmd_tx: self.params.conn_map_cmd_tx,
+            route_cleanup: self.params.route_cleanup,
             cid_generator: self.params.cid_generator,
             client_migration_rx: self.params.client_migration_rx,
             client_migration_socket: self.params.client_migration_socket,
@@ -537,6 +670,8 @@ where
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub init_rx_time: Option<SystemTime>,
     pub handshake_info: HandshakeInfo,
+    pub server_initial_metadata: Option<ServerInitialMetadata>,
+    pub route_cleanup: Option<RouteCleanupGuard>,
     /// Boxed because this value is moved by-value through several nested
     /// async state machines. Inlining a [`QuicheConnection`] here would
     /// duplicate its payload across the future state slots that hold it
@@ -970,6 +1105,78 @@ mod tests {
     use super::*;
 
     use std::io::ErrorKind;
+
+    #[test]
+    fn server_initial_metadata_canonicalizes_source_and_preserves_time() {
+        let start = Instant::now();
+        let metadata = ServerInitialMetadata::new(
+            Some(2),
+            "::ffff:192.0.2.1".parse().unwrap(),
+            start,
+        );
+
+        assert_eq!(metadata.profile_index(), Some(2));
+        assert_eq!(
+            metadata.canonical_source(),
+            "192.0.2.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(metadata.handshake_start(), start);
+        assert_eq!(format!("{metadata:?}"), "ServerInitialMetadata { .. }");
+    }
+
+    #[test]
+    fn route_cleanup_unmaps_initial_and_dynamically_tracked_ids() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let scid = ConnectionId::from_vec(vec![1, 2, 3]);
+        let pending_cid = ConnectionId::from_vec(vec![4, 5, 6]);
+        let dynamic_cid = ConnectionId::from_vec(vec![7, 8, 9]);
+
+        let mut cleanup = RouteCleanupGuard::new(
+            command_tx,
+            RouteOwner::new(),
+            scid.clone(),
+            Some(pending_cid.clone()),
+        );
+        cleanup.track(dynamic_cid.clone());
+        drop(cleanup);
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ConnectionMapCommand::UnmapCid { cid, owner: Some(_) }) if cid == scid
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ConnectionMapCommand::UnmapCid { cid, owner: Some(_) }) if cid == pending_cid
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ConnectionMapCommand::UnmapCid { cid, owner: Some(_) }) if cid == dynamic_cid
+        ));
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn route_cleanup_forgets_ids_already_unmapped_by_worker() {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let scid = ConnectionId::from_vec(vec![1, 2, 3]);
+        let pending_cid = ConnectionId::from_vec(vec![4, 5, 6]);
+        let mut cleanup = RouteCleanupGuard::new(
+            command_tx,
+            RouteOwner::new(),
+            scid.clone(),
+            Some(pending_cid),
+        );
+
+        cleanup.forget(&scid);
+        drop(cleanup);
+
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ConnectionMapCommand::UnmapCid { cid, owner: Some(_) })
+                if cid.as_ref() == [4, 5, 6]
+        ));
+        assert!(command_rx.try_recv().is_err());
+    }
 
     fn connection(
         peer_addr: SocketAddr,

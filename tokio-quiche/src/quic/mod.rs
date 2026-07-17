@@ -132,9 +132,11 @@ pub use self::connection::HandshakeInfo;
 pub use self::connection::Incoming;
 pub use self::connection::QuicCommand;
 pub use self::connection::QuicConnectionStats;
+pub use self::connection::ServerInitialMetadata;
 pub use self::connection::SimpleConnectionIdGenerator;
 pub use self::hooks::ClientInitialInfo;
 pub use self::hooks::ConnectionHook;
+pub use self::hooks::StatelessRetryDecision;
 
 /// Alias of [quiche::Connection] used internally by the crate.
 pub type QuicheConnection = quiche::Connection<crate::buf_factory::BufFactory>;

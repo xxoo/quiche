@@ -50,6 +50,7 @@ use crate::quic::connection::ConnectionEndpointState;
 use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::QuicConnectionStats;
+use crate::quic::connection::RouteCleanupGuard;
 use crate::quic::connection::SharedConnectionIdGenerator;
 use crate::quic::hooks::peer_ip_matches;
 use crate::quic::router::ConnectionMapCommand;
@@ -118,6 +119,7 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     pub(crate) audit_log_stats: Arc<QuicAuditStats>,
     pub(crate) write_state: WriteState,
     pub(crate) conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
+    pub(crate) route_cleanup: Option<RouteCleanupGuard>,
     pub(crate) cid_generator: Option<SharedConnectionIdGenerator>,
     pub(crate) client_migration_rx:
         Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
@@ -138,6 +140,7 @@ pub(crate) struct IoWorker<Tx, M, S> {
     audit_log_stats: Arc<QuicAuditStats>,
     write_state: WriteState,
     conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
+    route_cleanup: Option<RouteCleanupGuard>,
     cid_generator: Option<SharedConnectionIdGenerator>,
     client_migration_rx: Option<mpsc::UnboundedReceiver<ClientMigrationRequest>>,
     client_migration_socket: Option<MigratableUdpSocket>,
@@ -201,6 +204,7 @@ where
             audit_log_stats: params.audit_log_stats,
             write_state: params.write_state,
             conn_map_cmd_tx: params.conn_map_cmd_tx,
+            route_cleanup: params.route_cleanup,
             cid_generator: params.cid_generator,
             client_migration_rx: params.client_migration_rx,
             client_migration_socket: params.client_migration_socket,
@@ -213,11 +217,18 @@ where
         }
     }
 
-    fn fill_available_scids(&self, qconn: &mut QuicheConnection) {
+    fn fill_available_scids(&mut self, qconn: &mut QuicheConnection) {
         if qconn.scids_left() == 0 {
             return;
         }
-        let Some(cid_generator) = self.cid_generator.as_deref() else {
+        let Some(cid_generator) = self.cid_generator.clone() else {
+            return;
+        };
+        let Some(owner) = self
+            .route_cleanup
+            .as_ref()
+            .map(|cleanup| cleanup.owner().clone())
+        else {
             return;
         };
 
@@ -227,9 +238,15 @@ where
             let reset_token = random_u128();
             let new_cid = cid_generator.new_connection_id();
 
+            if qconn.new_scid(&new_cid, reset_token, false).is_err() {
+                // This only fails if we have reached the CID limit already
+                return;
+            }
+
             if self
                 .conn_map_cmd_tx
                 .send(ConnectionMapCommand::MapCid {
+                    owner: owner.clone(),
                     existing_cid: current_cid.clone(),
                     new_cid: new_cid.clone(),
                 })
@@ -238,22 +255,27 @@ where
                 // Can't do anything if the connection map is gone
                 return;
             }
-
-            if qconn.new_scid(&new_cid, reset_token, false).is_err() {
-                // This only fails if we have reached the CID limit already
-                return;
+            if let Some(route_cleanup) = &mut self.route_cleanup {
+                route_cleanup.track(new_cid);
             }
         }
     }
 
-    fn unmap_cid(&self, cid: ConnectionId<'static>) {
+    fn unmap_cid(&mut self, cid: ConnectionId<'static>) {
+        let owner = self
+            .route_cleanup
+            .as_ref()
+            .map(|cleanup| cleanup.owner().clone());
+        if let Some(route_cleanup) = &mut self.route_cleanup {
+            route_cleanup.forget(&cid);
+        }
         // If the connection map is gone, the ID is already "unmapped"
         let _ = self
             .conn_map_cmd_tx
-            .send(ConnectionMapCommand::UnmapCid(cid));
+            .send(ConnectionMapCommand::UnmapCid { cid, owner });
     }
 
-    fn refresh_connection_ids(&self, qconn: &mut QuicheConnection) {
+    fn refresh_connection_ids(&mut self, qconn: &mut QuicheConnection) {
         // Top up the connection's active CIDs
         self.fill_available_scids(qconn);
 
@@ -1033,6 +1055,7 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             audit_log_stats: value.audit_log_stats,
             write_state: value.write_state,
             conn_map_cmd_tx: value.conn_map_cmd_tx,
+            route_cleanup: value.route_cleanup,
             cid_generator: value.cid_generator,
             client_migration_rx: value.client_migration_rx,
             client_migration_socket: value.client_migration_socket,

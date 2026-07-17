@@ -34,6 +34,9 @@ use super::connection::HandshakeInfo;
 use super::connection::Incoming;
 use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
+use super::connection::RouteCleanupGuard;
+use super::connection::RouteOwner;
+use super::connection::ServerInitialMetadata;
 use super::connection::SimpleConnectionIdGenerator;
 use super::io::worker::WriterConfig;
 use super::QuicheConnection;
@@ -124,12 +127,16 @@ struct PollRecvData {
 
 /// A message to the listener notifiying a mapping for a connection should be
 /// removed.
-pub enum ConnectionMapCommand {
+pub(crate) enum ConnectionMapCommand {
     MapCid {
+        owner: RouteOwner,
         existing_cid: ConnectionId<'static>,
         new_cid: ConnectionId<'static>,
     },
-    UnmapCid(ConnectionId<'static>),
+    UnmapCid {
+        cid: ConnectionId<'static>,
+        owner: Option<RouteOwner>,
+    },
 }
 
 /// An `InboundPacketRouter` maintains a map of quic connections and routes
@@ -271,6 +278,10 @@ where
         (router, stream)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "migration wiring is kept explicit at this internal constructor"
+    )]
     pub(crate) fn new_with_client_migration(
         config: Config, socket_tx: Arc<Tx>, socket_rx: Rx,
         local_addr: SocketAddr, endpoint_state: ConnectionEndpointState,
@@ -371,6 +382,7 @@ where
             handshake_start_time,
             initial_pkt,
             fixed_peer_ip,
+            server_initial_metadata,
         } = new_connection;
 
         let Some(ref shutdown_tx) = self.shutdown_tx else {
@@ -385,6 +397,13 @@ where
         };
 
         let scid = conn.source_id().into_owned();
+        let route_owner = RouteOwner::new();
+        let route_cleanup = Some(RouteCleanupGuard::new(
+            self.conn_map_cmd_tx.clone(),
+            route_owner.clone(),
+            scid.clone(),
+            pending_cid.clone(),
+        ));
         let writer_cfg = WriterConfig {
             peer_addr,
             local_addr,
@@ -429,6 +448,8 @@ where
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time,
             handshake_info,
+            server_initial_metadata,
+            route_cleanup,
             quiche_conn: conn,
             socket: Arc::clone(&self.socket_tx),
             endpoint_state,
@@ -442,13 +463,24 @@ where
                 handshake_start_time,
             ));
 
-        self.conns.insert(&scid, &conn);
+        if !self.conns.insert(&route_owner, &scid, &conn) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "server connection ID is already routed",
+            ));
+        }
 
         // Add the client-generated "pending" connection ID to the map as well.
         // This is only required for QUIC servers, because clients can send
         // Initial packets with arbitrary DCIDs to servers.
         if let Some(pending_cid) = pending_cid {
-            self.conns.map_cid(&scid, &pending_cid);
+            if !self.conns.map_cid(&route_owner, &scid, &pending_cid) {
+                self.conns.unmap_cid(&route_owner, &scid);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "pending connection ID is already routed",
+                ));
+            }
         }
 
         self.metrics.accepted_initial_packet_count().inc();
@@ -797,11 +829,18 @@ where
             for cmd in buf.drain(..) {
                 match cmd {
                     ConnectionMapCommand::MapCid {
+                        owner,
                         existing_cid,
                         new_cid,
-                    } => self.conns.map_cid(&existing_cid, &new_cid),
-                    ConnectionMapCommand::UnmapCid(cid) =>
-                        self.conns.unmap_cid(&cid),
+                    } => {
+                        let _ =
+                            self.conns.map_cid(&owner, &existing_cid, &new_cid);
+                    },
+                    ConnectionMapCommand::UnmapCid { cid, owner } => {
+                        if let Some(owner) = owner {
+                            self.conns.unmap_cid(&owner, &cid);
+                        }
+                    },
                 }
             }
         }
@@ -950,6 +989,7 @@ pub struct NewConnection {
     /// or [`quiche::connect`].
     handshake_start_time: Instant,
     fixed_peer_ip: Option<std::net::IpAddr>,
+    server_initial_metadata: Option<ServerInitialMetadata>,
 }
 
 // TODO: the router module is private so we can't move these to /tests
@@ -1213,6 +1253,152 @@ mod tests {
         let _ = h3i::client::sync_client::connect(h3i_config, actions, None);
     }
 
+    fn client_initial_packet(
+        local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> Vec<u8> {
+        let scid = ConnectionId::from_ref(&[0x42; MAX_CONN_ID_LEN]);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        config.verify_peer(false);
+        config
+            .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        let mut connection =
+            quiche::connect(None, &scid, local_addr, peer_addr, &mut config)
+                .unwrap();
+        let mut packet = vec![0; MAX_DATAGRAM_SIZE];
+        let (written, _) = connection.send(&mut packet).unwrap();
+        packet.truncate(written);
+        packet
+    }
+
+    #[tokio::test]
+    async fn rejected_initial_removes_pending_route_before_reaccept() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let socket_tx = Arc::new(server_socket);
+        let acceptor = ConnectionAcceptor::new(
+            ConnectionAcceptorConfig {
+                connection_hook: None,
+                #[cfg(target_os = "linux")]
+                with_pktinfo: false,
+            },
+            Arc::clone(&socket_tx),
+            Default::default(),
+            Arc::new(SimpleConnectionIdGenerator),
+            DefaultMetrics,
+        );
+        let (socket_driver, mut incoming) = InboundPacketRouter::new(
+            config,
+            Arc::clone(&socket_tx),
+            socket_tx,
+            server_addr,
+            acceptor,
+            DefaultMetrics,
+        );
+        tokio::spawn(socket_driver);
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let packet = client_initial_packet(
+            client_socket.local_addr().unwrap(),
+            server_addr,
+        );
+        client_socket.send_to(&packet, server_addr).await.unwrap();
+        let first = time::timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        first.reject();
+
+        let second = time::timeout(Duration::from_secs(1), async {
+            loop {
+                client_socket.send_to(&packet, server_addr).await.unwrap();
+                if let Ok(Some(accepted)) =
+                    time::timeout(Duration::from_millis(20), incoming.recv())
+                        .await
+                {
+                    break accepted.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        second.reject();
+    }
+
+    #[tokio::test]
+    async fn cancelled_handshake_cleans_initial_and_dynamic_routes() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+        let socket = Arc::new(NoopDatagramSender);
+        let acceptor = ConnectionAcceptor::new(
+            ConnectionAcceptorConfig {
+                connection_hook: None,
+                #[cfg(target_os = "linux")]
+                with_pktinfo: false,
+            },
+            Arc::clone(&socket),
+            Default::default(),
+            Arc::new(SimpleConnectionIdGenerator),
+            DefaultMetrics,
+        );
+        let (mut router, mut accepted) = InboundPacketRouter::new(
+            config,
+            socket,
+            AlwaysReadyReceiver,
+            server_addr,
+            acceptor,
+            DefaultMetrics,
+        );
+        router
+            .on_incoming(Incoming {
+                peer_addr: client_addr,
+                local_addr: server_addr,
+                rx_time: None,
+                buf: client_initial_packet(client_addr, server_addr),
+                gro: None,
+                #[cfg(target_os = "linux")]
+                so_mark_data: None,
+            })
+            .unwrap();
+        let initial = accepted.try_recv().unwrap().unwrap();
+        assert_eq!(router.conns.len(), 2);
+
+        let (_connection, handshake) =
+            initial.handshake_fut(TestApp::new(None, None));
+        let mut handshake = Box::pin(handshake);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(handshake.as_mut().poll(&mut context).is_pending());
+        let _ = router.poll_conn_map_commands(&mut context);
+        assert!(router.conns.len() > 2);
+
+        drop(handshake);
+        let _ = router.poll_conn_map_commands(&mut context);
+        assert_eq!(router.conns.len(), 0);
+    }
+
     #[tokio::test]
     async fn test_timeout() {
         // Configure a short idle timeout to speed up connection reclamation as
@@ -1272,7 +1458,15 @@ mod tests {
         time::pause();
 
         let (h3_driver, _) = ServerH3Driver::new(Http3Settings::default());
-        let conn = incoming.recv().await.unwrap().unwrap();
+        let mut conn = incoming.recv().await.unwrap().unwrap();
+        let metadata = conn.take_server_initial_metadata().unwrap();
+        assert_eq!(metadata.profile_index(), None);
+        assert_eq!(
+            metadata.canonical_source(),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert!(metadata.handshake_start() <= Instant::now());
+        assert!(conn.take_server_initial_metadata().is_none());
         let drop_check = conn.incoming_ev_sender.clone();
         let _conn = conn.start(h3_driver);
 
@@ -1366,7 +1560,10 @@ mod tests {
         for _ in 0..20 {
             let random_cid = SimpleConnectionIdGenerator.new_connection_id();
             conn_map_cmd_tx
-                .send(ConnectionMapCommand::UnmapCid(random_cid))
+                .send(ConnectionMapCommand::UnmapCid {
+                    cid: random_cid,
+                    owner: None,
+                })
                 .unwrap();
         }
         // Give the IPR some time to process the ConnectionMapCommands

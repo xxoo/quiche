@@ -26,6 +26,7 @@
 
 use super::Incoming;
 use super::InitialQuicConnection;
+use super::RouteOwner;
 use crate::metrics::Metrics;
 use crate::quic::hooks::peer_ip_matches;
 
@@ -109,6 +110,7 @@ pub(crate) struct ConnectionMap {
 
 #[derive(Clone)]
 pub(crate) struct RoutedConnection {
+    owner: RouteOwner,
     sender: mpsc::Sender<Incoming>,
     fixed_peer_ip: Option<IpAddr>,
 }
@@ -123,27 +125,64 @@ impl RoutedConnection {
 
 impl ConnectionMap {
     pub(crate) fn insert<Tx, M>(
-        &mut self, cid: &ConnectionId<'_>, conn: &InitialQuicConnection<Tx, M>,
-    ) where
+        &mut self, owner: &RouteOwner, cid: &ConnectionId<'_>,
+        conn: &InitialQuicConnection<Tx, M>,
+    ) -> bool
+    where
         Tx: DatagramSocketSend + Send + 'static,
         M: Metrics,
     {
-        self.quic_id_map.insert(cid.into(), RoutedConnection {
+        let cid = cid.into();
+        if self
+            .quic_id_map
+            .get(&cid)
+            .is_some_and(|connection| !connection.owner.matches(owner))
+        {
+            return false;
+        }
+        self.quic_id_map.insert(cid, RoutedConnection {
+            owner: owner.clone(),
             sender: conn.incoming_ev_sender.clone(),
             fixed_peer_ip: conn.fixed_peer_ip(),
         });
+        true
     }
 
     pub(crate) fn map_cid(
-        &mut self, existing_cid: &ConnectionId<'_>, new_cid: &ConnectionId<'_>,
-    ) {
-        if let Some(connection) = self.quic_id_map.get(&existing_cid.into()) {
-            self.quic_id_map.insert(new_cid.into(), connection.clone());
+        &mut self, owner: &RouteOwner, existing_cid: &ConnectionId<'_>,
+        new_cid: &ConnectionId<'_>,
+    ) -> bool {
+        let new_cid = new_cid.into();
+        if self
+            .quic_id_map
+            .get(&new_cid)
+            .is_some_and(|connection| !connection.owner.matches(owner))
+        {
+            return false;
+        }
+        if let Some(connection) = self
+            .quic_id_map
+            .get(&existing_cid.into())
+            .filter(|connection| connection.owner.matches(owner))
+        {
+            self.quic_id_map.insert(new_cid, connection.clone());
+            true
+        } else {
+            false
         }
     }
 
-    pub(crate) fn unmap_cid(&mut self, cid: &ConnectionId<'_>) {
-        self.quic_id_map.remove(&cid.into());
+    pub(crate) fn unmap_cid(
+        &mut self, owner: &RouteOwner, cid: &ConnectionId<'_>,
+    ) {
+        let cid = cid.into();
+        if self
+            .quic_id_map
+            .get(&cid)
+            .is_some_and(|connection| connection.owner.matches(owner))
+        {
+            self.quic_id_map.remove(&cid);
+        }
     }
 
     pub(crate) fn get(&self, id: &ConnectionId) -> Option<&RoutedConnection> {
@@ -155,6 +194,11 @@ impl ConnectionMap {
         } else {
             self.quic_id_map.get(&id.into())
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.quic_id_map.len()
     }
 }
 
@@ -197,6 +241,7 @@ mod tests {
     fn fixed_peer_ip_is_filtered_before_the_connection_queue() {
         let (sender, mut receiver) = mpsc::channel(2);
         let route = RoutedConnection {
+            owner: RouteOwner::new(),
             sender,
             fixed_peer_ip: Some("192.0.2.2".parse().unwrap()),
         };
@@ -209,5 +254,56 @@ mod tests {
             receiver.try_recv().unwrap().peer_addr,
             "[::ffff:192.0.2.2]:5678".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn stale_owner_cannot_unmap_or_extend_reused_cid() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let stale_owner = RouteOwner::new();
+        let current_owner = RouteOwner::new();
+        let existing_cid = ConnectionId::from_ref(b"reused");
+        let new_cid = ConnectionId::from_ref(b"new");
+        let mut map = ConnectionMap::default();
+        map.quic_id_map
+            .insert((&existing_cid).into(), RoutedConnection {
+                owner: current_owner.clone(),
+                sender,
+                fixed_peer_ip: None,
+            });
+
+        assert!(!map.map_cid(&stale_owner, &existing_cid, &new_cid));
+        map.unmap_cid(&stale_owner, &existing_cid);
+        assert!(map.get(&existing_cid).is_some());
+        assert!(map.get(&new_cid).is_none());
+
+        assert!(map.map_cid(&current_owner, &existing_cid, &new_cid));
+        assert!(map.get(&new_cid).is_some());
+        map.unmap_cid(&current_owner, &existing_cid);
+        assert!(map.get(&existing_cid).is_none());
+    }
+
+    #[test]
+    fn delayed_map_cannot_overwrite_target_owned_by_another_connection() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let delayed_owner = RouteOwner::new();
+        let target_owner = RouteOwner::new();
+        let existing_cid = ConnectionId::from_ref(b"existing");
+        let target_cid = ConnectionId::from_ref(b"target");
+        let mut map = ConnectionMap::default();
+        map.quic_id_map
+            .insert((&existing_cid).into(), RoutedConnection {
+                owner: delayed_owner.clone(),
+                sender: sender.clone(),
+                fixed_peer_ip: None,
+            });
+        map.quic_id_map
+            .insert((&target_cid).into(), RoutedConnection {
+                owner: target_owner.clone(),
+                sender,
+                fixed_peer_ip: None,
+            });
+
+        assert!(!map.map_cid(&delayed_owner, &existing_cid, &target_cid));
+        assert!(map.get(&target_cid).unwrap().owner.matches(&target_owner));
     }
 }
