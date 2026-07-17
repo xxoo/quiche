@@ -30,6 +30,15 @@ use quiche::ConnectionId;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
+/// Whether an empty-token server Initial may produce a stateless Retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatelessRetryDecision {
+    /// Continue constructing and sending the Retry packet.
+    Allow,
+    /// Silently drop the Initial before allocating Retry state.
+    Drop,
+}
+
 /// Client information available while handling an Initial packet.
 ///
 /// This information is intentionally limited to data that is available before
@@ -82,6 +91,18 @@ pub trait ConnectionHook {
         &self, _info: &ClientInitialInfo<'_>,
     ) -> Option<usize> {
         None
+    }
+
+    /// Decides whether an empty-token Initial may produce a stateless Retry.
+    ///
+    /// This is called exactly once after version and server profile validation,
+    /// and immediately before Retry connection ID and token construction. The
+    /// source is canonicalized and the selected profile is frozen for this
+    /// decision. Initials carrying a token never call this hook.
+    fn stateless_retry_decision(
+        &self, _profile_index: Option<usize>, _canonical_source: IpAddr,
+    ) -> StatelessRetryDecision {
+        StatelessRetryDecision::Allow
     }
 
     /// Whether a connection using this server config profile must keep the

@@ -128,6 +128,8 @@ where
         #[cfg(feature = "perf-quic-listener-metrics")]
         init_rx_time: None,
         handshake_info: HandshakeInfo::new(Instant::now(), None),
+        server_initial_metadata: None,
+        route_cleanup: None,
         quiche_conn: Box::new(quiche_conn),
         socket,
         endpoint_state: ConnectionEndpointState::new(local_addr, peer_addr),
@@ -159,7 +161,7 @@ impl ConnCloseReceiver {
     pub fn poll_recv(&mut self, cx: &mut Context) -> Poll<()> {
         loop {
             let cmd = ready!(self.0.poll_recv(cx));
-            if matches!(cmd, None | Some(ConnectionMapCommand::UnmapCid(_))) {
+            if matches!(cmd, None | Some(ConnectionMapCommand::UnmapCid { .. })) {
                 // Raw connections have neither a `pending_cid` nor a
                 // `cid_generator`. The only time they unmap a CID is when the
                 // connection is closed.
