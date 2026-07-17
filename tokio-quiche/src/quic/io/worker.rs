@@ -51,6 +51,7 @@ use crate::quic::connection::HandshakeError;
 use crate::quic::connection::Incoming;
 use crate::quic::connection::QuicConnectionStats;
 use crate::quic::connection::SharedConnectionIdGenerator;
+use crate::quic::hooks::peer_ip_matches;
 use crate::quic::router::ConnectionMapCommand;
 use crate::quic::QuicheConnection;
 use crate::socket::MigratableUdpSocket;
@@ -89,6 +90,7 @@ pub struct WriterConfig {
     pub with_gso: bool,
     pub pacing_offload: bool,
     pub with_pktinfo: bool,
+    pub fixed_peer_ip: Option<std::net::IpAddr>,
 }
 
 #[derive(Default)]
@@ -154,6 +156,30 @@ async fn recv_client_migration(
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+fn recv_incoming(
+    fixed_peer_ip: Option<std::net::IpAddr>, qconn: &mut QuicheConnection,
+    mut pkt: Incoming,
+) -> QuicResult<bool> {
+    if !peer_ip_matches(fixed_peer_ip, pkt.peer_addr.ip()) {
+        return Ok(false);
+    }
+
+    let recv_info = quiche::RecvInfo {
+        from: pkt.peer_addr,
+        to: pkt.local_addr,
+    };
+
+    if let Some(gro) = pkt.gro {
+        for dgram in pkt.buf.chunks_mut(gro as usize) {
+            qconn.recv(dgram, recv_info)?;
+        }
+    } else {
+        qconn.recv(&mut pkt.buf, recv_info)?;
+    }
+
+    Ok(true)
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -351,8 +377,7 @@ where
                     .take()
                     .or_else(|| ctx.incoming_pkt_receiver.try_recv().ok())
                 {
-                    self.process_incoming(qconn, pkt)?;
-                    did_recv = true;
+                    did_recv |= self.process_incoming(qconn, pkt)?;
                 }
 
                 self.conn_stage.on_read(did_recv, qconn, ctx)?;
@@ -798,22 +823,9 @@ where
 
     /// Process the incoming packet
     fn process_incoming(
-        &mut self, qconn: &mut QuicheConnection, mut pkt: Incoming,
-    ) -> QuicResult<()> {
-        let recv_info = quiche::RecvInfo {
-            from: pkt.peer_addr,
-            to: pkt.local_addr,
-        };
-
-        if let Some(gro) = pkt.gro {
-            for dgram in pkt.buf.chunks_mut(gro as usize) {
-                qconn.recv(dgram, recv_info)?;
-            }
-        } else {
-            qconn.recv(&mut pkt.buf, recv_info)?;
-        }
-
-        Ok(())
+        &mut self, qconn: &mut QuicheConnection, pkt: Incoming,
+    ) -> QuicResult<bool> {
+        recv_incoming(self.cfg.fixed_peer_ip, qconn, pkt)
     }
 
     // When a connection is established, process application data, if not the task
@@ -1197,4 +1209,150 @@ fn random_u128() -> u128 {
     let mut buf = [0; 16];
     boring::rand::rand_bytes(&mut buf).expect("boring's RAND_bytes never fails");
     u128::from_ne_bytes(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quiche::test_utils::emit_flight;
+    use quiche::test_utils::Pipe;
+    use std::net::IpAddr;
+    use std::net::Ipv4Addr;
+    use std::net::SocketAddr;
+
+    fn test_config(server: bool) -> quiche::Config {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        if server {
+            config
+                .load_cert_chain_from_pem_file(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../quiche/examples/cert.crt"
+                ))
+                .unwrap();
+            config
+                .load_priv_key_from_pem_file(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../quiche/examples/cert.key"
+                ))
+                .unwrap();
+        }
+        config.set_application_protos(&[b"source-gate"]).unwrap();
+        config.set_initial_max_data(64);
+        config.set_initial_max_stream_data_bidi_local(64);
+        config.set_initial_max_stream_data_bidi_remote(64);
+        config.set_initial_max_streams_bidi(1);
+        config.verify_peer(false);
+        config
+    }
+
+    fn incoming(
+        peer_addr: SocketAddr, local_addr: SocketAddr, buf: Vec<u8>,
+        gro: Option<i32>,
+    ) -> Incoming {
+        Incoming {
+            peer_addr,
+            local_addr,
+            rx_time: None,
+            buf,
+            gro,
+            #[cfg(target_os = "linux")]
+            so_mark_data: None,
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ConnectionState {
+        recv: usize,
+        recv_bytes: u64,
+        paths_count: usize,
+        paths: Vec<(SocketAddr, SocketAddr, bool, usize)>,
+        stream_readable: bool,
+        local_error: bool,
+        peer_error: bool,
+    }
+
+    fn state(conn: &QuicheConnection) -> ConnectionState {
+        let stats = conn.stats();
+        let paths = conn
+            .path_stats()
+            .map(|path| (path.local_addr, path.peer_addr, path.active, path.recv))
+            .collect();
+        ConnectionState {
+            recv: stats.recv,
+            recv_bytes: stats.recv_bytes,
+            paths_count: stats.paths_count,
+            paths,
+            stream_readable: conn.stream_readable(0),
+            local_error: conn.local_error().is_some(),
+            peer_error: conn.peer_error().is_some(),
+        }
+    }
+
+    #[test]
+    fn fixed_peer_ip_drops_before_quiche_and_allows_original_source() {
+        let mut client_config = test_config(false);
+        let mut server_config = test_config(true);
+        let mut pipe = Pipe::<crate::buf_factory::BufFactory>::
+            with_client_and_server_config_and_buf(
+                &mut client_config,
+                &mut server_config,
+            )
+            .unwrap();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+
+        let initial_peer = Pipe::client_addr();
+        pipe.client.stream_send(0, b"hello", false).unwrap();
+        let mut flight = emit_flight(&mut pipe.client).unwrap();
+        assert_eq!(flight.len(), 1);
+        let (packet, send_info) = flight.pop().unwrap();
+        let before = state(&pipe.server);
+
+        let wrong_peer = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            initial_peer.port(),
+        );
+        assert!(!recv_incoming(
+            Some(initial_peer.ip()),
+            &mut pipe.server,
+            incoming(wrong_peer, send_info.to, packet.clone(), None),
+        )
+        .unwrap());
+        assert_eq!(state(&pipe.server), before);
+
+        assert!(recv_incoming(
+            Some(initial_peer.ip()),
+            &mut pipe.server,
+            incoming(send_info.from, send_info.to, packet, None),
+        )
+        .unwrap());
+        let mut received = [0; 5];
+        assert_eq!(pipe.server.stream_recv(0, &mut received), Ok((5, false)));
+        assert_eq!(&received, b"hello");
+
+        pipe.client.stream_send(0, b"!", false).unwrap();
+        let flight = emit_flight(&mut pipe.client).unwrap();
+        for (packet, send_info) in flight {
+            let same_ip_new_port =
+                SocketAddr::new(send_info.from.ip(), send_info.from.port() + 1);
+            assert!(recv_incoming(
+                Some(initial_peer.ip()),
+                &mut pipe.server,
+                incoming(same_ip_new_port, send_info.to, packet, None),
+            )
+            .unwrap());
+        }
+        let mut received = [0; 1];
+        assert_eq!(pipe.server.stream_recv(0, &mut received), Ok((1, false)));
+        assert_eq!(&received, b"!");
+
+        let before_gro = state(&pipe.server);
+        assert!(!recv_incoming(
+            Some(initial_peer.ip()),
+            &mut pipe.server,
+            incoming(wrong_peer, Pipe::server_addr(), vec![0], Some(1)),
+        )
+        .unwrap());
+        assert_eq!(state(&pipe.server), before_gro);
+    }
 }

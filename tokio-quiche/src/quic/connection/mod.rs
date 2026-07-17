@@ -46,6 +46,7 @@ use futures::Future;
 use quiche::ConnectionId;
 use std::fmt;
 use std::io;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -325,6 +326,10 @@ where
     /// The remote address for this connection.
     pub fn peer_addr(&self) -> SocketAddr {
         self.endpoint_state.peer_addr()
+    }
+
+    pub(crate) fn fixed_peer_ip(&self) -> Option<IpAddr> {
+        self.params.writer_cfg.fixed_peer_ip
     }
 
     /// [boring]'s SSL object for this connection.
