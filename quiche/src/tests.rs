@@ -4823,6 +4823,112 @@ fn recv_empty_buffer(
     assert_eq!(pipe.server_recv(&mut buf[..0]), Err(Error::BufferTooShort));
 }
 
+#[test]
+fn recv_udp_payload_size_cap() {
+    fn assert_cap(sender: &mut Connection, receiver: &mut Connection) {
+        let mut buf = [0; 65535];
+
+        assert_eq!(sender.dgram_send(&[0; MIN_CLIENT_INITIAL_LEN]), Ok(()));
+        let (len, send_info) = sender.send(&mut buf).unwrap();
+        assert!(len > MIN_CLIENT_INITIAL_LEN);
+        let info = RecvInfo {
+            from: send_info.from,
+            to: send_info.to,
+        };
+        let recv_pid = receiver
+            .paths
+            .path_id_from_addrs(&(info.to, info.from))
+            .unwrap();
+
+        if receiver.is_server {
+            receiver
+                .paths
+                .get_mut(recv_pid)
+                .unwrap()
+                .verified_peer_address = false;
+        }
+
+        receiver.local_transport_params.max_udp_payload_size = (len - 1) as u64;
+
+        let before = (
+            receiver.dgram_recv_queue_len(),
+            receiver.dgram_recv_queue_byte_size(),
+            receiver.stats().recv,
+            receiver.paths.get(recv_pid).unwrap().max_send_bytes,
+        );
+        let packet = buf[..len].to_vec();
+
+        assert_eq!(receiver.recv(&mut buf[..len], info), Ok(len));
+        assert_eq!(&buf[..len], packet);
+        assert_eq!(
+            (
+                receiver.dgram_recv_queue_len(),
+                receiver.dgram_recv_queue_byte_size(),
+                receiver.stats().recv,
+                receiver.paths.get(recv_pid).unwrap().max_send_bytes,
+            ),
+            before
+        );
+
+        receiver.local_transport_params.max_udp_payload_size = len as u64;
+        assert_eq!(receiver.recv(&mut buf[..len], info), Ok(len));
+        assert_eq!(receiver.dgram_recv_queue_len(), before.0 + 1);
+        assert_eq!(receiver.dgram_recv_queue_byte_size(), before.1 + 1200);
+        assert_eq!(receiver.stats().recv, before.2 + 1);
+        assert_eq!(
+            receiver.paths.get(recv_pid).unwrap().max_send_bytes,
+            before.3 +
+                usize::from(receiver.is_server) *
+                    len *
+                    receiver.max_amplification_factor
+        );
+    }
+
+    let mut config =
+        test_utils::Pipe::default_config("bbr2_gcongestion").unwrap();
+    config.enable_dgram(true, 10, 10);
+    config.set_max_send_udp_payload_size(1400);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_cap(&mut pipe.client, &mut pipe.server);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_cap(&mut pipe.server, &mut pipe.client);
+}
+
+#[test]
+fn recv_udp_payload_size_cap_handles_coalesced_packets() {
+    let mut buf = [0; 65535];
+    let mut pipe = test_utils::Pipe::new("bbr2_gcongestion").unwrap();
+
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+
+    assert!(pipe.client.is_established());
+    assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+    let sent_before = pipe.client.sent_count;
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let coalesced_packets = pipe.client.sent_count - sent_before;
+    assert!(coalesced_packets > 1);
+
+    let recv_before = pipe.server.recv_count;
+    pipe.server.local_transport_params.max_udp_payload_size = (len - 1) as u64;
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+    assert_eq!(pipe.server.recv_count, recv_before);
+
+    pipe.server.local_transport_params.max_udp_payload_size = len as u64;
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+    assert_eq!(pipe.server.recv_count, recv_before + coalesced_packets);
+}
+
 #[rstest]
 fn stop_sending_before_flushed_packets(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

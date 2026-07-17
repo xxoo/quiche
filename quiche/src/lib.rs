@@ -2828,6 +2828,10 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::BufferTooShort);
         }
 
+        if len as u64 > self.local_transport_params.max_udp_payload_size {
+            return Ok(len);
+        }
+
         let recv_pid = self.paths.path_id_from_addrs(&(info.to, info.from));
 
         if let Some(recv_pid) = recv_pid {
