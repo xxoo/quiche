@@ -648,7 +648,12 @@ fn early_data_accepted_verdicts() {
     )
     .unwrap();
     assert_eq!(rejected.client.set_session(&session), Ok(()));
-    assert_eq!(rejected.handshake(), Ok(()));
+    let flight = test_utils::emit_flight(&mut rejected.client).unwrap();
+    assert!(rejected.client.is_in_early_data());
+    test_utils::process_flight(&mut rejected.server, flight).unwrap();
+    assert_eq!(rejected.advance(), Ok(()));
+    assert!(rejected.client.is_established());
+    assert!(rejected.server.is_established());
     assert!(rejected.client.is_resumed());
     assert!(rejected.server.is_resumed());
     assert!(!rejected.client.early_data_accepted());
