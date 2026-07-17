@@ -1215,6 +1215,7 @@ fn random_u128() -> u128 {
 mod tests {
     use super::*;
     use quiche::test_utils::emit_flight;
+    use quiche::test_utils::process_flight;
     use quiche::test_utils::Pipe;
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
@@ -1260,6 +1261,16 @@ mod tests {
         }
     }
 
+    fn test_pipe() -> Pipe<crate::buf_factory::BufFactory> {
+        let mut client_config = test_config(false);
+        let mut server_config = test_config(true);
+        Pipe::with_client_and_server_config_and_buf(
+            &mut client_config,
+            &mut server_config,
+        )
+        .unwrap()
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct ConnectionState {
         recv: usize,
@@ -1290,14 +1301,7 @@ mod tests {
 
     #[test]
     fn fixed_peer_ip_drops_before_quiche_and_allows_original_source() {
-        let mut client_config = test_config(false);
-        let mut server_config = test_config(true);
-        let mut pipe = Pipe::<crate::buf_factory::BufFactory>::
-            with_client_and_server_config_and_buf(
-                &mut client_config,
-                &mut server_config,
-            )
-            .unwrap();
+        let mut pipe = test_pipe();
         pipe.handshake().unwrap();
         pipe.advance().unwrap();
 
@@ -1354,5 +1358,75 @@ mod tests {
         )
         .unwrap());
         assert_eq!(state(&pipe.server), before_gro);
+    }
+
+    #[test]
+    fn fixed_peer_ip_drops_initial_flight_without_changing_connection() {
+        let mut pipe = test_pipe();
+
+        let initial_peer = Pipe::client_addr();
+        let wrong_peer = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            initial_peer.port(),
+        );
+        let flight = emit_flight(&mut pipe.client).unwrap();
+        let before = state(&pipe.server);
+
+        for (packet, send_info) in &flight {
+            assert!(!recv_incoming(
+                Some(initial_peer.ip()),
+                &mut pipe.server,
+                incoming(wrong_peer, send_info.to, packet.clone(), None),
+            )
+            .unwrap());
+        }
+        assert_eq!(state(&pipe.server), before);
+
+        for (packet, send_info) in flight {
+            assert!(recv_incoming(
+                Some(initial_peer.ip()),
+                &mut pipe.server,
+                incoming(send_info.from, send_info.to, packet, None),
+            )
+            .unwrap());
+        }
+
+        for _ in 0..8 {
+            if pipe.client.is_established() && pipe.server.is_established() {
+                break;
+            }
+            let flight = emit_flight(&mut pipe.server).unwrap();
+            process_flight(&mut pipe.client, flight).unwrap();
+            let flight = emit_flight(&mut pipe.client).unwrap();
+            process_flight(&mut pipe.server, flight).unwrap();
+        }
+        assert!(pipe.client.is_established());
+        assert!(pipe.server.is_established());
+    }
+
+    #[test]
+    fn unfixed_peer_accepts_stream_packet_from_new_ip() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+
+        pipe.client.stream_send(0, b"tunnel", false).unwrap();
+        let mut flight = emit_flight(&mut pipe.client).unwrap();
+        assert_eq!(flight.len(), 1);
+        let (packet, send_info) = flight.pop().unwrap();
+        let new_peer = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            send_info.from.port(),
+        );
+
+        assert!(recv_incoming(
+            None,
+            &mut pipe.server,
+            incoming(new_peer, send_info.to, packet, None),
+        )
+        .unwrap());
+        let mut received = [0; 6];
+        assert_eq!(pipe.server.stream_recv(0, &mut received), Ok((6, false)));
+        assert_eq!(&received, b"tunnel");
     }
 }
