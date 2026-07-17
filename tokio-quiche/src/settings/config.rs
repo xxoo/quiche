@@ -661,4 +661,131 @@ mod tests {
         calls.sort();
         assert_eq!(calls, vec![(None, true), (Some(0), true)]);
     }
+
+    #[test]
+    fn server_profile_false_verify_override_preserves_required_client_cert() {
+        struct RequiredClientCertHook(Arc<Mutex<Vec<Option<usize>>>>);
+
+        impl ConnectionHook for RequiredClientCertHook {
+            fn create_custom_ssl_context_builder(
+                &self, settings: Option<TlsCertificatePaths<'_>>,
+                profile_index: Option<usize>,
+            ) -> crate::QuicResult<Option<boring::ssl::SslContextBuilder>>
+            {
+                self.0.lock().unwrap().push(profile_index);
+
+                let Some(settings) = settings else {
+                    return Ok(None);
+                };
+
+                let mut builder = boring::ssl::SslContextBuilder::new(
+                    boring::ssl::SslMethod::tls(),
+                )?;
+                builder.set_certificate_chain_file(settings.cert)?;
+                builder.set_private_key_file(
+                    settings.private_key,
+                    boring::ssl::SslFiletype::PEM,
+                )?;
+                builder.cert_store_mut().set_flags(
+                    boring::x509::verify::X509VerifyFlags::PARTIAL_CHAIN,
+                );
+                builder.cert_store_mut().add_cert(
+                    boring::x509::X509::from_pem(&std::fs::read(settings.cert)?)?,
+                )?;
+                builder.set_verify(
+                    boring::ssl::SslVerifyMode::PEER |
+                        boring::ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+                );
+
+                Ok(Some(builder))
+            }
+        }
+
+        fn client_config(with_certificate: bool) -> quiche::Config {
+            let mut config =
+                quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            config.set_application_protos(&[b"peer-cert-mode"]).unwrap();
+            if with_certificate {
+                config
+                    .load_cert_chain_from_pem_file(TEST_CERT_FILE)
+                    .unwrap();
+                config.load_priv_key_from_pem_file(TEST_KEY_FILE).unwrap();
+            }
+            config.verify_peer(false);
+            config
+        }
+
+        fn pump_handshake(
+            pipe: &mut quiche::test_utils::Pipe,
+        ) -> Result<(), quiche::Error> {
+            use quiche::test_utils::emit_flight;
+            use quiche::test_utils::process_flight;
+
+            for _ in 0..8 {
+                if pipe.client.is_established() && pipe.server.is_established() {
+                    return Ok(());
+                }
+
+                match emit_flight(&mut pipe.client) {
+                    Ok(flight) => process_flight(&mut pipe.server, flight)?,
+                    Err(quiche::Error::Done) => (),
+                    Err(error) => return Err(error),
+                }
+                match emit_flight(&mut pipe.server) {
+                    Ok(flight) => process_flight(&mut pipe.client, flight)?,
+                    Err(quiche::Error::Done) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+
+            Err(quiche::Error::Done)
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut params = ConnectionParams::default();
+        params.settings.alpn = vec![b"peer-cert-mode".to_vec()];
+        params.hooks.connection_hook =
+            Some(Arc::new(RequiredClientCertHook(Arc::clone(&calls))));
+        params.server_config_profiles.push(ServerConfigOverrides {
+            tls_cert: Some(TlsCertificatePaths {
+                cert: TEST_CERT_FILE,
+                private_key: TEST_KEY_FILE,
+                kind: CertificateKind::X509,
+            }),
+            verify_peer: Some(false),
+            ..Default::default()
+        });
+
+        let mut config =
+            Config::new(&params, SocketCapabilities::default()).unwrap();
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(calls, vec![None, Some(0)]);
+
+        let mut authenticated_client = client_config(true);
+        let mut authenticated =
+            quiche::test_utils::Pipe::with_client_and_server_config(
+                &mut authenticated_client,
+                config
+                    .server_profile_config_mut(Some(0))
+                    .unwrap()
+                    .quiche_config_mut(),
+            )
+            .unwrap();
+        assert_eq!(pump_handshake(&mut authenticated), Ok(()));
+        assert!(authenticated.server.peer_cert().is_some());
+
+        let mut anonymous_client = client_config(false);
+        let mut anonymous =
+            quiche::test_utils::Pipe::with_client_and_server_config(
+                &mut anonymous_client,
+                config
+                    .server_profile_config_mut(Some(0))
+                    .unwrap()
+                    .quiche_config_mut(),
+            )
+            .unwrap();
+        assert_eq!(pump_handshake(&mut anonymous), Err(quiche::Error::TlsFail));
+        assert!(!anonymous.server.is_established());
+    }
 }
