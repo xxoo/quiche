@@ -27,11 +27,13 @@
 use super::Incoming;
 use super::InitialQuicConnection;
 use crate::metrics::Metrics;
+use crate::quic::hooks::peer_ip_matches;
 
 use datagram_socket::DatagramSocketSend;
 use quiche::ConnectionId;
 use quiche::MAX_CONN_ID_LEN;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use tokio::sync::mpsc;
 
 const U64_SZ: usize = std::mem::size_of::<u64>();
@@ -102,7 +104,21 @@ impl From<&ConnectionId<'_>> for CidOwned {
 /// connection.
 #[derive(Default)]
 pub(crate) struct ConnectionMap {
-    quic_id_map: BTreeMap<CidOwned, mpsc::Sender<Incoming>>,
+    quic_id_map: BTreeMap<CidOwned, RoutedConnection>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RoutedConnection {
+    sender: mpsc::Sender<Incoming>,
+    fixed_peer_ip: Option<IpAddr>,
+}
+
+impl RoutedConnection {
+    pub(crate) fn enqueue(&self, incoming: Incoming) {
+        if peer_ip_matches(self.fixed_peer_ip, incoming.peer_addr.ip()) {
+            let _ = self.sender.try_send(incoming);
+        }
+    }
 }
 
 impl ConnectionMap {
@@ -112,15 +128,17 @@ impl ConnectionMap {
         Tx: DatagramSocketSend + Send + 'static,
         M: Metrics,
     {
-        let ev_sender = conn.incoming_ev_sender.clone();
-        self.quic_id_map.insert(cid.into(), ev_sender);
+        self.quic_id_map.insert(cid.into(), RoutedConnection {
+            sender: conn.incoming_ev_sender.clone(),
+            fixed_peer_ip: conn.fixed_peer_ip(),
+        });
     }
 
     pub(crate) fn map_cid(
         &mut self, existing_cid: &ConnectionId<'_>, new_cid: &ConnectionId<'_>,
     ) {
-        if let Some(ev_sender) = self.quic_id_map.get(&existing_cid.into()) {
-            self.quic_id_map.insert(new_cid.into(), ev_sender.clone());
+        if let Some(connection) = self.quic_id_map.get(&existing_cid.into()) {
+            self.quic_id_map.insert(new_cid.into(), connection.clone());
         }
     }
 
@@ -128,9 +146,7 @@ impl ConnectionMap {
         self.quic_id_map.remove(&cid.into());
     }
 
-    pub(crate) fn get(
-        &self, id: &ConnectionId,
-    ) -> Option<&mpsc::Sender<Incoming>> {
+    pub(crate) fn get(&self, id: &ConnectionId) -> Option<&RoutedConnection> {
         if id.len() == MAX_CONN_ID_LEN {
             // Although both branches run the same code, the one here will
             // generate an optimized version for the length we are
@@ -146,6 +162,19 @@ impl ConnectionMap {
 mod tests {
     use super::*;
     use quiche::ConnectionId;
+    use std::net::SocketAddr;
+
+    fn incoming(peer_addr: &str) -> Incoming {
+        Incoming {
+            peer_addr: peer_addr.parse().unwrap(),
+            local_addr: "192.0.2.1:443".parse().unwrap(),
+            rx_time: None,
+            buf: vec![1],
+            gro: None,
+            #[cfg(target_os = "linux")]
+            so_mark_data: None,
+        }
+    }
 
     #[test]
     fn cid_storage() {
@@ -161,6 +190,24 @@ mod tests {
         assert!(
             matches!(boxed, CidOwned::Generic(_)),
             "Oversized CID is not boxed"
+        );
+    }
+
+    #[test]
+    fn fixed_peer_ip_is_filtered_before_the_connection_queue() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let route = RoutedConnection {
+            sender,
+            fixed_peer_ip: Some("192.0.2.2".parse().unwrap()),
+        };
+
+        route.enqueue(incoming("192.0.2.3:1234"));
+        assert!(receiver.try_recv().is_err());
+
+        route.enqueue(incoming("[::ffff:192.0.2.2]:5678"));
+        assert_eq!(
+            receiver.try_recv().unwrap().peer_addr,
+            "[::ffff:192.0.2.2]:5678".parse::<SocketAddr>().unwrap()
         );
     }
 }

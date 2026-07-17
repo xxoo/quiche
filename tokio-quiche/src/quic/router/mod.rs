@@ -300,8 +300,8 @@ where
         let start = std::time::Instant::now();
 
         if let Some(dcid) = short_dcid(&incoming.buf) {
-            if let Some(ev_sender) = self.conns.get(&dcid) {
-                let _ = ev_sender.try_send(incoming);
+            if let Some(connection) = self.conns.get(&dcid) {
+                connection.enqueue(incoming);
                 return Ok(());
             }
         }
@@ -313,8 +313,8 @@ where
                 e => io::Error::other(e),
             })?;
 
-        if let Some(ev_sender) = self.conns.get(&hdr.dcid) {
-            let _ = ev_sender.try_send(incoming);
+        if let Some(connection) = self.conns.get(&hdr.dcid) {
+            connection.enqueue(incoming);
             return Ok(());
         }
 
@@ -370,6 +370,7 @@ where
             mut cid_generator,
             handshake_start_time,
             initial_pkt,
+            fixed_peer_ip,
         } = new_connection;
 
         let Some(ref shutdown_tx) = self.shutdown_tx else {
@@ -399,6 +400,7 @@ where
             } else {
                 self.config.has_ipv6pktinfo
             },
+            fixed_peer_ip,
         };
 
         let handshake_info = HandshakeInfo::new(
@@ -947,6 +949,7 @@ pub struct NewConnection {
     /// When the handshake started. Should be called before [`quiche::accept`]
     /// or [`quiche::connect`].
     handshake_start_time: Instant,
+    fixed_peer_ip: Option<std::net::IpAddr>,
 }
 
 // TODO: the router module is private so we can't move these to /tests

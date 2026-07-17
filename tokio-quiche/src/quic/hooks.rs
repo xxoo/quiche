@@ -27,6 +27,7 @@
 use crate::settings::TlsCertificatePaths;
 use boring::ssl::SslContextBuilder;
 use quiche::ConnectionId;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 
 /// Client information available while handling an Initial packet.
@@ -81,5 +82,48 @@ pub trait ConnectionHook {
         &self, _info: &ClientInitialInfo<'_>,
     ) -> Option<usize> {
         None
+    }
+
+    /// Whether a connection using this server config profile must keep the
+    /// source IP from its accepted Initial packet.
+    ///
+    /// This is called once after profile selection and before the server-side
+    /// connection is created. When enabled, later packets from another
+    /// canonical IP are silently discarded before entering quiche; source
+    /// port changes remain allowed.
+    fn server_config_profile_requires_fixed_peer_ip(
+        &self, _profile_index: Option<usize>,
+    ) -> bool {
+        false
+    }
+}
+
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
+}
+
+pub(crate) fn peer_ip_matches(expected: Option<IpAddr>, actual: IpAddr) -> bool {
+    expected.is_none_or(|expected| expected == canonical_ip(actual))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn fixed_peer_ip_matches_exact_and_ipv4_mapped_only() {
+        let expected_v4 = Ipv4Addr::new(192, 0, 2, 1);
+        let expected = IpAddr::V4(expected_v4);
+        let mapped = IpAddr::V6(expected_v4.to_ipv6_mapped());
+
+        assert!(peer_ip_matches(Some(expected), expected));
+        assert!(peer_ip_matches(Some(expected), mapped));
+        assert!(!peer_ip_matches(
+            Some(expected),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))
+        ));
+        assert!(peer_ip_matches(None, Ipv6Addr::LOCALHOST.into()));
     }
 }

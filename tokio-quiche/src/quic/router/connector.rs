@@ -261,6 +261,7 @@ where
                 initial_pkt: None,
                 cid_generator: None,
                 handshake_start_time,
+                fixed_peer_ip: None,
             }))
         } else if conn.is_closed() {
             let scid = conn.source_id();

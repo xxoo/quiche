@@ -25,6 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::io;
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,6 +45,7 @@ use crate::metrics::labels;
 use crate::metrics::Metrics;
 use crate::quic::addr_validation_token::AddrValidationTokenManager;
 use crate::quic::connection::SharedConnectionIdGenerator;
+use crate::quic::hooks::canonical_ip;
 use crate::quic::router::NewConnection;
 use crate::quic::ClientInitialInfo;
 use crate::quic::ConnectionHook;
@@ -67,6 +70,19 @@ pub(crate) struct ConnectionAcceptorConfig {
         Option<Arc<dyn ConnectionHook + Send + Sync + 'static>>,
     #[cfg(target_os = "linux")]
     pub(crate) with_pktinfo: bool,
+}
+
+impl ConnectionAcceptorConfig {
+    fn fixed_peer_ip(
+        &self, profile_index: Option<usize>, peer_addr: SocketAddr,
+    ) -> Option<IpAddr> {
+        self.connection_hook
+            .as_ref()
+            .filter(|hook| {
+                hook.server_config_profile_requires_fixed_peer_ip(profile_index)
+            })
+            .map(|_| canonical_ip(peer_addr.ip()))
+    }
 }
 
 impl<S, M> ConnectionAcceptor<S, M>
@@ -103,6 +119,9 @@ where
                 server_profile_not_found(profile_index),
             ));
         };
+
+        let fixed_peer_ip =
+            self.config.fixed_peer_ip(profile_index, incoming.peer_addr);
 
         let mut conn = {
             let quiche_config = profile.quiche_config_mut();
@@ -157,6 +176,7 @@ where
             pending_cid: Some(pending_cid),
             cid_generator: Some(Arc::clone(&self.cid_generator)),
             initial_pkt: Some(incoming),
+            fixed_peer_ip,
         }))
     }
 
@@ -321,5 +341,49 @@ fn server_profile_not_found(index: Option<usize>) -> String {
     match index {
         Some(index) => format!("unknown server config profile index {index}"),
         None => "default server config profile is missing".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::TlsCertificatePaths;
+    use crate::QuicResult;
+    use boring::ssl::SslContextBuilder;
+    use std::sync::Mutex;
+
+    struct RecordingHook(Mutex<Vec<Option<usize>>>);
+
+    impl ConnectionHook for RecordingHook {
+        fn create_custom_ssl_context_builder(
+            &self, _settings: Option<TlsCertificatePaths<'_>>,
+            _profile_index: Option<usize>,
+        ) -> QuicResult<Option<SslContextBuilder>> {
+            Ok(None)
+        }
+
+        fn server_config_profile_requires_fixed_peer_ip(
+            &self, profile_index: Option<usize>,
+        ) -> bool {
+            self.0.lock().unwrap().push(profile_index);
+            true
+        }
+    }
+
+    #[test]
+    fn fixed_peer_ip_policy_receives_selected_profile() {
+        let hook = Arc::new(RecordingHook(Mutex::new(Vec::new())));
+        let config = ConnectionAcceptorConfig {
+            connection_hook: Some(hook.clone()),
+            #[cfg(target_os = "linux")]
+            with_pktinfo: false,
+        };
+        let peer_addr = "[::ffff:192.0.2.1]:443".parse().unwrap();
+
+        assert_eq!(
+            config.fixed_peer_ip(Some(2), peer_addr),
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(*hook.0.lock().unwrap(), vec![Some(2)]);
     }
 }

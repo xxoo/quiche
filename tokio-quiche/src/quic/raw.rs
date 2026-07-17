@@ -114,6 +114,7 @@ where
         with_gso: false,
         pacing_offload: false,
         with_pktinfo: false,
+        fixed_peer_ip: None,
     };
 
     let conn_params = QuicConnectionParams {
