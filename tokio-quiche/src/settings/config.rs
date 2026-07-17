@@ -496,9 +496,13 @@ mod tests {
     use crate::quic::ConnectionHook;
     use crate::settings::CertificateKind;
     use crate::settings::ConnectionParams;
+    use crate::settings::Hooks;
+    use crate::settings::QuicSettings;
     use crate::settings::ServerConfigOverrides;
     use crate::settings::TlsCertificatePaths;
     use crate::socket::SocketCapabilities;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -507,6 +511,8 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../quiche/examples/cert.crt");
     const TEST_KEY_FILE: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../quiche/examples/cert.key");
+    const WRONG_CERT_FILE: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../apps/src/bin/cert.crt");
 
     #[test]
     fn server_config_profiles_apply_overrides() {
@@ -787,5 +793,150 @@ mod tests {
             .unwrap();
         assert_eq!(pump_handshake(&mut anonymous), Err(quiche::Error::TlsFail));
         assert!(!anonymous.server.is_established());
+    }
+
+    #[test]
+    fn client_verify_peer_preserves_custom_certificate_verifier() {
+        const ALPN: &[u8] = b"client-verifier-path";
+
+        struct ClientVerifierHook {
+            calls: Arc<Mutex<Vec<Option<usize>>>>,
+            verification_count: Arc<AtomicUsize>,
+            trust_cert: &'static str,
+        }
+
+        impl ConnectionHook for ClientVerifierHook {
+            fn create_custom_ssl_context_builder(
+                &self, settings: Option<TlsCertificatePaths<'_>>,
+                profile_index: Option<usize>,
+            ) -> crate::QuicResult<Option<boring::ssl::SslContextBuilder>>
+            {
+                assert!(settings.is_none());
+                self.calls.lock().unwrap().push(profile_index);
+
+                let mut builder = boring::ssl::SslContextBuilder::new(
+                    boring::ssl::SslMethod::tls_client(),
+                )?;
+                builder.cert_store_mut().set_flags(
+                    boring::x509::verify::X509VerifyFlags::PARTIAL_CHAIN,
+                );
+                builder.cert_store_mut().add_cert(
+                    boring::x509::X509::from_pem(&std::fs::read(
+                        self.trust_cert,
+                    )?)?,
+                )?;
+                builder.set_verify(boring::ssl::SslVerifyMode::PEER);
+
+                let verification_count = Arc::clone(&self.verification_count);
+                builder.set_cert_verify_callback(move |context| {
+                    verification_count.fetch_add(1, Ordering::Relaxed);
+                    context.verify_cert().unwrap_or(false)
+                });
+
+                Ok(Some(builder))
+            }
+        }
+
+        fn make_client_config(
+            trust_cert: &'static str,
+        ) -> (Config, Arc<AtomicUsize>) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let verification_count = Arc::new(AtomicUsize::new(0));
+            let settings = QuicSettings {
+                alpn: vec![ALPN.to_vec()],
+                verify_peer: true,
+                peer_trust_roots: None,
+                enable_early_data: false,
+                ..Default::default()
+            };
+
+            let params = ConnectionParams::new_client(settings, None, Hooks {
+                connection_hook: Some(Arc::new(ClientVerifierHook {
+                    calls: Arc::clone(&calls),
+                    verification_count: Arc::clone(&verification_count),
+                    trust_cert,
+                })),
+            });
+            assert!(params.tls_cert.is_none());
+            assert!(params.settings.peer_trust_roots.is_none());
+            assert!(params.settings.verify_peer);
+            assert!(!params.settings.enable_early_data);
+            assert!(params.server_config_profiles.is_empty());
+            assert!(params.session.is_none());
+            assert!(params.zero_rtt_dgrams.is_empty());
+            assert!(params.zero_rtt_streams.is_empty());
+
+            let config =
+                Config::new(&params, SocketCapabilities::default()).unwrap();
+            assert_eq!(*calls.lock().unwrap(), vec![None]);
+
+            (config, verification_count)
+        }
+
+        fn make_server_config() -> quiche::Config {
+            let mut config =
+                quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+            config.set_application_protos(&[ALPN]).unwrap();
+            config
+                .load_cert_chain_from_pem_file(TEST_CERT_FILE)
+                .unwrap();
+            config.load_priv_key_from_pem_file(TEST_KEY_FILE).unwrap();
+            config
+        }
+
+        fn pump_handshake(
+            pipe: &mut quiche::test_utils::Pipe,
+        ) -> Result<(), quiche::Error> {
+            use quiche::test_utils::emit_flight;
+            use quiche::test_utils::process_flight;
+
+            for _ in 0..8 {
+                if pipe.client.is_established() && pipe.server.is_established() {
+                    return Ok(());
+                }
+
+                match emit_flight(&mut pipe.client) {
+                    Ok(flight) => process_flight(&mut pipe.server, flight)?,
+                    Err(quiche::Error::Done) => (),
+                    Err(error) => return Err(error),
+                }
+                match emit_flight(&mut pipe.server) {
+                    Ok(flight) => process_flight(&mut pipe.client, flight)?,
+                    Err(quiche::Error::Done) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+
+            Err(quiche::Error::Done)
+        }
+
+        let (mut client_config, verification_count) =
+            make_client_config(TEST_CERT_FILE);
+        let mut server_config = make_server_config();
+        let mut authenticated =
+            quiche::test_utils::Pipe::with_client_and_server_config(
+                &mut client_config.quiche_config,
+                &mut server_config,
+            )
+            .unwrap();
+        assert_eq!(pump_handshake(&mut authenticated), Ok(()));
+        assert!(authenticated.client.peer_cert().is_some());
+        assert!(verification_count.load(Ordering::Relaxed) > 0);
+
+        let (mut client_config, verification_count) =
+            make_client_config(WRONG_CERT_FILE);
+        let mut server_config = make_server_config();
+        let mut wrongly_trusted =
+            quiche::test_utils::Pipe::with_client_and_server_config(
+                &mut client_config.quiche_config,
+                &mut server_config,
+            )
+            .unwrap();
+        assert_eq!(
+            pump_handshake(&mut wrongly_trusted),
+            Err(quiche::Error::TlsFail)
+        );
+        assert!(!wrongly_trusted.client.is_established());
+        assert!(verification_count.load(Ordering::Relaxed) > 0);
     }
 }
