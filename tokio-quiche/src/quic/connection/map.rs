@@ -153,11 +153,11 @@ impl ConnectionMap {
         new_cid: &ConnectionId<'_>,
     ) -> bool {
         let new_cid = new_cid.into();
-        if self
-            .quic_id_map
-            .get(&new_cid)
-            .is_some_and(|connection| !connection.owner.matches(owner))
-        {
+        // A duplicate target is a collision even when it already belongs to
+        // this owner. Treating it as success could let the worker attempt to
+        // register the same quiche CID with a different reset token and then
+        // unmap the still-live route when that registration fails.
+        if self.quic_id_map.contains_key(&new_cid) {
             return false;
         }
         if let Some(connection) = self
@@ -305,5 +305,26 @@ mod tests {
 
         assert!(!map.map_cid(&delayed_owner, &existing_cid, &target_cid));
         assert!(map.get(&target_cid).unwrap().owner.matches(&target_owner));
+    }
+
+    #[test]
+    fn duplicate_target_from_same_owner_is_a_collision() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let owner = RouteOwner::new();
+        let existing_cid = ConnectionId::from_ref(b"existing");
+        let target_cid = ConnectionId::from_ref(b"target");
+        let mut map = ConnectionMap::default();
+        for cid in [&existing_cid, &target_cid] {
+            map.quic_id_map.insert(cid.into(), RoutedConnection {
+                owner: owner.clone(),
+                sender: sender.clone(),
+                fixed_peer_ip: None,
+            });
+        }
+
+        assert!(!map.map_cid(&owner, &existing_cid, &target_cid));
+        assert!(map.get(&existing_cid).unwrap().owner.matches(&owner));
+        assert!(map.get(&target_cid).unwrap().owner.matches(&owner));
+        assert_eq!(map.len(), 2);
     }
 }
