@@ -9205,6 +9205,11 @@ impl<F: BufFactory> Connection<F> {
                 .ok_or(Error::OutOfIdentifiers)?
         };
 
+        let pmtud =
+            self.paths.get_active().ok().and_then(|path| {
+                path.pmtud.as_ref().map(pmtud::Pmtud::for_new_path)
+            });
+
         let mut path = path::Path::new(
             local_addr,
             peer_addr,
@@ -9213,6 +9218,7 @@ impl<F: BufFactory> Connection<F> {
             false,
             None,
         );
+        path.pmtud = pmtud;
         path.active_dcid_seq = Some(dcid_seq);
 
         let pid = self

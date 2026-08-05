@@ -79,6 +79,11 @@ impl Pmtud {
         }
     }
 
+    /// Creates fresh discovery state for another path with the same settings.
+    pub(crate) fn for_new_path(&self) -> Self {
+        Self::new(self.maximum_supported_mtu, self.max_probes)
+    }
+
     /// Indicates whether probing should continue on the connection.
     ///
     /// Checks there are no probes in flight, that a PMTU has not been
@@ -280,6 +285,19 @@ mod tests {
         let pmtud = Pmtud::new(1500, 5);
         assert_eq!(pmtud.max_probes, 5);
         assert_ne!(pmtud.max_probes, MAX_PROBES_DEFAULT);
+    }
+
+    #[test]
+    fn new_path_inherits_settings_not_discovery_state() {
+        let mut pmtud = Pmtud::new(1500, 5);
+        pmtud.successful_probe(1400);
+
+        let new_path = pmtud.for_new_path();
+
+        assert_eq!(new_path.maximum_supported_mtu, 1500);
+        assert_eq!(new_path.max_probes, 5);
+        assert_eq!(new_path.get_current_mtu(), MIN_PLPMTU);
+        assert!(new_path.should_probe());
     }
 
     #[test]

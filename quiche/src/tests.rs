@@ -11135,6 +11135,8 @@ fn connection_migration(
         .unwrap();
     config.verify_peer(false);
     config.set_active_connection_id_limit(3);
+    config.discover_pmtu(true);
+    config.set_pmtud_max_probes(5);
     config.set_initial_max_data(30);
     config.set_initial_max_stream_data_bidi_local(15);
     config.set_initial_max_stream_data_bidi_remote(15);
@@ -11222,6 +11224,15 @@ fn connection_migration(
     // Case 2: the client migrates on a path that was not previously
     // validated, and has spare SCIDs/DCIDs to do so.
     assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
+    assert!(pipe
+        .client
+        .paths
+        .get_active()
+        .unwrap()
+        .pmtud
+        .as_ref()
+        .unwrap()
+        .should_probe());
     assert_eq!(pipe.client.stream_send(4, b"data", true), Ok(4));
     assert_eq!(pipe.advance(), Ok(()));
     assert_eq!(

@@ -95,6 +95,7 @@ async fn test_tokio_quiche_client_hard_migration() {
     assert_eq!(outcome.previous_local_addr, initial_local_addr);
     assert_eq!(outcome.local_addr, expected_migrated_addr);
     assert_eq!(outcome.peer_addr, server_addr);
+    assert_eq!(outcome.datagram_payload_max, Some(1306));
     assert_eq!(conn.local_addr(), expected_migrated_addr);
 
     send_tokio_quiche_request(&mut controller, 2).await;

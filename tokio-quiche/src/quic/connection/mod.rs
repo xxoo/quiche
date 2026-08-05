@@ -261,6 +261,8 @@ pub struct ClientMigrationOutcome {
     pub local_addr: SocketAddr,
     /// The peer address this connection remains connected to.
     pub peer_addr: SocketAddr,
+    /// The current application DATAGRAM payload limit on the migrated path.
+    pub datagram_payload_max: Option<usize>,
 }
 
 pub(crate) struct ClientMigrationRequest {
