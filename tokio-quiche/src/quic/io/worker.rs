@@ -402,11 +402,13 @@ where
         self.write_state.selected_path = None;
         self.write_state.pending_paths = quiche::SocketAddrIter::default();
         self.write_state.has_pending_data = true;
+        qconn.revalidate_pmtu();
 
         Ok(ClientMigrationOutcome {
             previous_local_addr,
             local_addr,
             peer_addr,
+            datagram_payload_max: qconn.dgram_max_writable_len(),
         })
     }
 

@@ -79,6 +79,11 @@ impl Pmtud {
         }
     }
 
+    /// Creates fresh discovery state for another path with the same settings.
+    pub(crate) fn for_new_path(&self) -> Self {
+        Self::new(self.maximum_supported_mtu, self.max_probes)
+    }
+
     /// Indicates whether probing should continue on the connection.
     ///
     /// Checks there are no probes in flight, that a PMTU has not been
@@ -228,12 +233,13 @@ impl Pmtud {
     // a probe on the next opportunity. If this probe is dropped
     // PMTUD will restart from a fresh state
     pub fn revalidate_pmtu(&mut self) {
-        if let Some(pmtu) = self.pmtu {
-            self.set_probe_size(pmtu);
-            self.pmtu = None;
-            self.probe_failure_count = 0;
-            self.largest_successful_probe_size = None;
-        }
+        let probe_size = self.pmtu.unwrap_or(self.maximum_supported_mtu);
+        self.set_probe_size(probe_size);
+        self.smallest_failed_probe_size = None;
+        self.largest_successful_probe_size = None;
+        self.pmtu = None;
+        self.in_flight = false;
+        self.probe_failure_count = 0;
     }
 
     fn set_pmtu(&mut self, successful_probe_size: usize) {
@@ -280,6 +286,19 @@ mod tests {
         let pmtud = Pmtud::new(1500, 5);
         assert_eq!(pmtud.max_probes, 5);
         assert_ne!(pmtud.max_probes, MAX_PROBES_DEFAULT);
+    }
+
+    #[test]
+    fn new_path_inherits_settings_not_discovery_state() {
+        let mut pmtud = Pmtud::new(1500, 5);
+        pmtud.successful_probe(1400);
+
+        let new_path = pmtud.for_new_path();
+
+        assert_eq!(new_path.maximum_supported_mtu, 1500);
+        assert_eq!(new_path.max_probes, 5);
+        assert_eq!(new_path.get_current_mtu(), MIN_PLPMTU);
+        assert!(new_path.should_probe());
     }
 
     #[test]
@@ -468,6 +487,21 @@ mod tests {
         assert_eq!(pmtud.smallest_failed_probe_size, Some(1500));
         assert!(pmtud.largest_successful_probe_size.is_none());
         assert_eq!(pmtud.get_probe_size(), 1350); // (1200 + 1500) / 2
+    }
+
+    #[test]
+    fn pmtud_revalidation_discards_incomplete_probe_state() {
+        let mut pmtud = Pmtud::new(1500, 1);
+        pmtud.failed_probe(1500);
+        pmtud.in_flight = true;
+
+        pmtud.revalidate_pmtu();
+
+        assert_eq!(pmtud.get_current_mtu(), MIN_PLPMTU);
+        assert_eq!(pmtud.get_probe_size(), 1500);
+        assert!(pmtud.smallest_failed_probe_size.is_none());
+        assert!(pmtud.largest_successful_probe_size.is_none());
+        assert!(pmtud.should_probe());
     }
 
     #[test]

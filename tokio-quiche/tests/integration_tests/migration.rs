@@ -30,14 +30,17 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tokio_quiche::http3::driver::ClientH3Controller;
+use tokio_quiche::http3::driver::ClientH3Driver;
 use tokio_quiche::http3::driver::ClientH3Event;
 use tokio_quiche::http3::driver::H3Event;
 use tokio_quiche::http3::driver::InboundFrame;
 use tokio_quiche::http3::driver::NewClientRequest;
 use tokio_quiche::quic::connect_migratable;
+use tokio_quiche::quic::connect_migratable_with_config;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::quiche::h3::NameValue as _;
 use tokio_quiche::ConnectionIdGenerator as _;
+use tokio_quiche::ConnectionParams;
 
 use crate::fixtures::*;
 
@@ -69,9 +72,12 @@ async fn test_tokio_quiche_client_hard_migration() {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     socket.connect(server_addr).await.unwrap();
 
-    let (conn, mut controller) = timeout(
+    let (driver, mut controller) = ClientH3Driver::new(Http3Settings::default());
+    let mut params = ConnectionParams::default();
+    params.settings.discover_path_mtu = true;
+    let conn = timeout(
         Duration::from_secs(5),
-        connect_migratable(socket, Some("test.com")),
+        connect_migratable_with_config(socket, Some("test.com"), &params, driver),
     )
     .await
     .expect("connect timed out")
@@ -95,6 +101,7 @@ async fn test_tokio_quiche_client_hard_migration() {
     assert_eq!(outcome.previous_local_addr, initial_local_addr);
     assert_eq!(outcome.local_addr, expected_migrated_addr);
     assert_eq!(outcome.peer_addr, server_addr);
+    assert_eq!(outcome.datagram_payload_max, Some(1156));
     assert_eq!(conn.local_addr(), expected_migrated_addr);
 
     send_tokio_quiche_request(&mut controller, 2).await;

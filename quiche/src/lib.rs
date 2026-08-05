@@ -7699,9 +7699,14 @@ impl<F: BufFactory> Connection<F> {
     /// valid PMTU.
     #[inline]
     pub fn revalidate_pmtu(&mut self) {
+        let peer_max_udp_payload_size =
+            self.peer_transport_params.max_udp_payload_size as usize;
         if let Ok(active_path) = self.paths.get_active_mut() {
             if let Some(pmtud) = active_path.pmtud.as_mut() {
                 pmtud.revalidate_pmtu();
+                active_path.recovery.pmtud_update_max_datagram_size(
+                    pmtud.get_current_mtu().min(peer_max_udp_payload_size),
+                );
             }
         }
     }
@@ -9205,6 +9210,11 @@ impl<F: BufFactory> Connection<F> {
                 .ok_or(Error::OutOfIdentifiers)?
         };
 
+        let pmtud =
+            self.paths.get_active().ok().and_then(|path| {
+                path.pmtud.as_ref().map(pmtud::Pmtud::for_new_path)
+            });
+
         let mut path = path::Path::new(
             local_addr,
             peer_addr,
@@ -9213,6 +9223,7 @@ impl<F: BufFactory> Connection<F> {
             false,
             None,
         );
+        path.pmtud = pmtud;
         path.active_dcid_seq = Some(dcid_seq);
 
         let pid = self
