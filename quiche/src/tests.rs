@@ -11224,6 +11224,8 @@ fn connection_migration(
     // Case 2: the client migrates on a path that was not previously
     // validated, and has spare SCIDs/DCIDs to do so.
     assert_eq!(pipe.client.migrate(client_addr_3, server_addr), Ok(2));
+    pipe.client.revalidate_pmtu();
+    assert_eq!(pipe.client.max_send_udp_payload_size(), 1200);
     assert!(pipe
         .client
         .paths
@@ -11343,6 +11345,11 @@ fn connection_migration(
             .peer_addr(),
         server_addr
     );
+
+    // Reusing a previously active path must also discard its old PMTU cap.
+    assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
+    pipe.client.revalidate_pmtu();
+    assert_eq!(pipe.client.max_send_udp_payload_size(), 1200);
 }
 
 #[rstest]

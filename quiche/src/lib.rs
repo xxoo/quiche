@@ -7699,9 +7699,14 @@ impl<F: BufFactory> Connection<F> {
     /// valid PMTU.
     #[inline]
     pub fn revalidate_pmtu(&mut self) {
+        let peer_max_udp_payload_size =
+            self.peer_transport_params.max_udp_payload_size as usize;
         if let Ok(active_path) = self.paths.get_active_mut() {
             if let Some(pmtud) = active_path.pmtud.as_mut() {
                 pmtud.revalidate_pmtu();
+                active_path.recovery.pmtud_update_max_datagram_size(
+                    pmtud.get_current_mtu().min(peer_max_udp_payload_size),
+                );
             }
         }
     }
