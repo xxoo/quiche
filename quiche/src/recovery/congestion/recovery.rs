@@ -29,6 +29,7 @@ use std::cmp;
 use std::time::Duration;
 use std::time::Instant;
 
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
 use super::RecoveryConfig;
@@ -83,6 +84,10 @@ struct RecoveryEpoch {
     /// An association of packet numbers in a packet number space to information
     /// about them.
     sent_packets: VecDeque<Sent>,
+
+    tracked_ack_eliciting: BTreeSet<u64>,
+    tracked_ack_eliciting_acked: usize,
+    tracked_ack_eliciting_lost: usize,
 
     loss_probes: usize,
     in_flight_count: usize,
@@ -185,6 +190,10 @@ impl RecoveryEpoch {
                 } else {
                     acked_packets += 1;
 
+                    if self.tracked_ack_eliciting.remove(&unacked.pkt_num) {
+                        self.tracked_ack_eliciting_acked += 1;
+                    }
+
                     if unacked.in_flight {
                         self.in_flight_count -= 1;
                         acked_bytes += unacked.size;
@@ -261,11 +270,16 @@ impl RecoveryEpoch {
                 unacked.time_lost = Some(now);
 
                 if unacked.is_pmtud_probe {
+                    self.tracked_ack_eliciting.remove(&unacked.pkt_num);
                     pmtud_lost_bytes += unacked.size;
                     self.in_flight_count -= 1;
 
                     // Do not track PMTUD probes losses.
                     continue;
+                }
+
+                if self.tracked_ack_eliciting.remove(&unacked.pkt_num) {
+                    self.tracked_ack_eliciting_lost += 1;
                 }
 
                 if unacked.in_flight {
@@ -863,6 +877,7 @@ impl RecoveryOps for LegacyRecovery {
         self.bytes_in_flight.saturating_subtract(unacked_bytes, now);
 
         epoch.sent_packets.clear();
+        epoch.tracked_ack_eliciting.clear();
         epoch.clear_lost_frames();
         epoch.acked_frames.clear();
 
@@ -879,6 +894,19 @@ impl RecoveryOps for LegacyRecovery {
     ) -> (usize, usize) {
         // Time threshold loss detection.
         self.detect_lost_packets(epoch, now, trace_id)
+    }
+
+    fn track_ack_eliciting_packet(&mut self, pkt_num: u64, epoch: Epoch) {
+        self.epochs[epoch].tracked_ack_eliciting.insert(pkt_num);
+    }
+
+    fn take_tracked_ack_eliciting_counts(&mut self) -> (usize, usize) {
+        self.epochs.iter_mut().fold((0, 0), |(acked, lost), epoch| {
+            (
+                acked + std::mem::take(&mut epoch.tracked_ack_eliciting_acked),
+                lost + std::mem::take(&mut epoch.tracked_ack_eliciting_lost),
+            )
+        })
     }
 
     fn loss_detection_timer(&self) -> Option<Instant> {

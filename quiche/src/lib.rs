@@ -1383,6 +1383,12 @@ where
     /// Total number of lost packets that were later acked.
     spurious_lost_count: usize,
 
+    /// Total number of scheduled ack-eliciting packets that were acked.
+    scheduled_ack_eliciting_acked_count: usize,
+
+    /// Total number of scheduled ack-eliciting packets that were lost.
+    scheduled_ack_eliciting_lost_count: usize,
+
     /// Total number of packets sent with data retransmitted.
     retrans_count: usize,
 
@@ -2095,6 +2101,8 @@ impl<F: BufFactory> Connection<F> {
             acked_count: 0,
             lost_count: 0,
             spurious_lost_count: 0,
+            scheduled_ack_eliciting_acked_count: 0,
+            scheduled_ack_eliciting_lost_count: 0,
             retrans_count: 0,
             dgram_sent_count: 0,
             dgram_recv_count: 0,
@@ -5314,6 +5322,9 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        let tracked_ack_eliciting =
+            ack_eliciting && !is_pmtud_probe && path.needs_ack_eliciting;
+
         if ack_eliciting && !is_pmtud_probe {
             path.needs_ack_eliciting = false;
             path.recovery.ping_sent(epoch);
@@ -5480,7 +5491,14 @@ impl<F: BufFactory> Connection<F> {
             completed: self.handshake_completed,
         };
 
-        self.on_packet_sent(send_pid, sent_pkt, epoch, handshake_status, now)?;
+        self.on_packet_sent(
+            send_pid,
+            sent_pkt,
+            epoch,
+            tracked_ack_eliciting,
+            handshake_status,
+            now,
+        )?;
 
         let path = self.paths.get_mut(send_pid)?;
         qlog_with_type!(QLOG_METRICS, self.qlog, q, {
@@ -5534,10 +5552,11 @@ impl<F: BufFactory> Connection<F> {
 
     fn on_packet_sent(
         &mut self, send_pid: usize, sent_pkt: recovery::Sent,
-        epoch: packet::Epoch, handshake_status: recovery::HandshakeStatus,
-        now: Instant,
+        epoch: packet::Epoch, tracked_ack_eliciting: bool,
+        handshake_status: recovery::HandshakeStatus, now: Instant,
     ) -> Result<()> {
         let path = self.paths.get_mut(send_pid)?;
+        let pkt_num = sent_pkt.pkt_num;
 
         // It's fine to set the skip counter based on a non-active path's values.
         let cwnd = path.recovery.cwnd();
@@ -5556,6 +5575,10 @@ impl<F: BufFactory> Connection<F> {
             now,
             &self.trace_id,
         );
+
+        if tracked_ack_eliciting {
+            path.recovery.track_ack_eliciting_packet(pkt_num, epoch);
+        }
 
         Ok(())
     }
@@ -7123,6 +7146,10 @@ impl<F: BufFactory> Connection<F> {
 
                     self.lost_count += lost_packets;
                     self.lost_bytes += lost_bytes as u64;
+                    let (acked, lost) =
+                        p.recovery.take_tracked_ack_eliciting_counts();
+                    self.scheduled_ack_eliciting_acked_count += acked;
+                    self.scheduled_ack_eliciting_lost_count += lost;
 
                     qlog_with_type!(QLOG_METRICS, self.qlog, q, {
                         p.recovery.maybe_qlog(q, now);
@@ -7845,6 +7872,10 @@ impl<F: BufFactory> Connection<F> {
             acked: self.acked_count,
             lost: self.lost_count,
             spurious_lost: self.spurious_lost_count,
+            scheduled_ack_eliciting_acked: self
+                .scheduled_ack_eliciting_acked_count,
+            scheduled_ack_eliciting_lost: self
+                .scheduled_ack_eliciting_lost_count,
             retrans: self.retrans_count,
             sent_bytes: self.sent_bytes,
             recv_bytes: self.recv_bytes,
@@ -8373,6 +8404,10 @@ impl<F: BufFactory> Connection<F> {
                     self.lost_bytes += lost_bytes as u64;
                     self.acked_count += acked_packets;
                     self.acked_bytes += acked_bytes as u64;
+                    let (acked, lost) =
+                        p.recovery.take_tracked_ack_eliciting_counts();
+                    self.scheduled_ack_eliciting_acked_count += acked;
+                    self.scheduled_ack_eliciting_lost_count += lost;
                     self.spurious_lost_count += spurious_losses;
                 }
             },
@@ -9156,6 +9191,11 @@ impl<F: BufFactory> Connection<F> {
 
                 self.lost_count += lost_packets;
                 self.lost_bytes += lost_bytes as u64;
+                let (acked, lost) = old_active_path
+                    .recovery
+                    .take_tracked_ack_eliciting_counts();
+                self.scheduled_ack_eliciting_acked_count += acked;
+                self.scheduled_ack_eliciting_lost_count += lost;
             }
         }
 
@@ -9410,6 +9450,12 @@ pub struct Stats {
 
     /// The number of QUIC packets that were marked as lost but later acked.
     pub spurious_lost: usize,
+
+    /// The number of scheduled ack-eliciting packets that were acked.
+    pub scheduled_ack_eliciting_acked: usize,
+
+    /// The number of scheduled ack-eliciting packets that were lost.
+    pub scheduled_ack_eliciting_lost: usize,
 
     /// The number of sent QUIC packets with retransmitted data.
     pub retrans: usize,

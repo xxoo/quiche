@@ -231,6 +231,12 @@ pub trait RecoveryOps {
     fn on_path_change(
         &mut self, epoch: packet::Epoch, now: Instant, _trace_id: &str,
     ) -> (usize, usize);
+
+    fn track_ack_eliciting_packet(
+        &mut self, pkt_num: u64, epoch: packet::Epoch,
+    );
+
+    fn take_tracked_ack_eliciting_counts(&mut self) -> (usize, usize);
     fn loss_detection_timer(&self) -> Option<Instant>;
     fn cwnd(&self) -> usize;
     fn cwnd_available(&self) -> usize;
@@ -916,6 +922,7 @@ mod tests {
             now,
             "",
         );
+        r.track_ack_eliciting_packet(0, packet::Epoch::Application);
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 1);
         assert_eq!(r.bytes_in_flight(), 1000);
@@ -978,6 +985,7 @@ mod tests {
             now,
             "",
         );
+        r.track_ack_eliciting_packet(2, packet::Epoch::Application);
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 3);
         assert_eq!(r.bytes_in_flight(), 3000);
         assert_eq!(r.bytes_in_flight_duration(), Duration::ZERO);
@@ -1043,6 +1051,7 @@ mod tests {
         assert_eq!(r.bytes_in_flight(), 2000);
         assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(10));
         assert_eq!(r.lost_count(), 0);
+        assert_eq!(r.take_tracked_ack_eliciting_counts(), (1, 0));
 
         // Wait until loss detection timer expires.
         now = r.loss_detection_timer().unwrap();
@@ -1146,6 +1155,21 @@ mod tests {
         assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(40));
 
         assert_eq!(r.lost_count(), 2);
+        assert_eq!(r.take_tracked_ack_eliciting_counts(), (0, 1));
+
+        let mut late = RangeSet::default();
+        late.insert(2..3);
+        r.on_ack_received(
+            &late,
+            25,
+            packet::Epoch::Application,
+            HandshakeStatus::default(),
+            now,
+            None,
+            "",
+        )
+        .unwrap();
+        assert_eq!(r.take_tracked_ack_eliciting_counts(), (0, 0));
 
         // Wait 1 RTT.
         now += r.rtt();

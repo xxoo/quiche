@@ -5,6 +5,7 @@ use crate::recovery::TIME_THRESHOLD_OVERHEAD_MULTIPLIER;
 use crate::Error;
 use crate::Result;
 
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
@@ -101,6 +102,10 @@ struct RecoveryEpoch {
     /// about them.
     sent_packets: VecDeque<SentPacket>,
 
+    tracked_ack_eliciting: BTreeSet<u64>,
+    tracked_ack_eliciting_acked: usize,
+    tracked_ack_eliciting_lost: usize,
+
     loss_probes: usize,
     pkts_in_flight: usize,
 
@@ -161,6 +166,7 @@ impl RecoveryEpoch {
             .sum();
 
         std::mem::take(&mut self.sent_packets);
+        self.tracked_ack_eliciting.clear();
         self.clear_lost_frames();
         std::mem::take(&mut self.acked_frames);
         self.time_of_last_ack_eliciting_packet = None;
@@ -229,6 +235,10 @@ impl RecoveryEpoch {
                             ..
                         } => {
                             acked_packets += 1;
+
+                            if self.tracked_ack_eliciting.remove(pkt_num) {
+                                self.tracked_ack_eliciting_acked += 1;
+                            }
 
                             if in_flight {
                                 self.pkts_in_flight -= 1;
@@ -311,6 +321,7 @@ impl RecoveryEpoch {
                             self.pkts_in_flight -= 1;
 
                             if is_pmtud_probe {
+                                self.tracked_ack_eliciting.remove(pkt_num);
                                 pmtud_lost_bytes += sent_bytes;
                                 pmtud_lost_packets.push(*pkt_num);
                                 // Do not track PMTUD probes losses
@@ -318,6 +329,10 @@ impl RecoveryEpoch {
                             }
 
                             lost_bytes += sent_bytes;
+                        }
+
+                        if self.tracked_ack_eliciting.remove(pkt_num) {
+                            self.tracked_ack_eliciting_lost += 1;
                         }
 
                         newly_lost.push(Lost {
@@ -1030,6 +1045,21 @@ impl RecoveryOps for GRecovery {
             self.detect_and_remove_lost_packets(epoch, now);
 
         (lost_packets, lost_bytes)
+    }
+
+    fn track_ack_eliciting_packet(
+        &mut self, pkt_num: u64, epoch: packet::Epoch,
+    ) {
+        self.epochs[epoch].tracked_ack_eliciting.insert(pkt_num);
+    }
+
+    fn take_tracked_ack_eliciting_counts(&mut self) -> (usize, usize) {
+        self.epochs.iter_mut().fold((0, 0), |(acked, lost), epoch| {
+            (
+                acked + std::mem::take(&mut epoch.tracked_ack_eliciting_acked),
+                lost + std::mem::take(&mut epoch.tracked_ack_eliciting_lost),
+            )
+        })
     }
 
     fn loss_detection_timer(&self) -> Option<Instant> {

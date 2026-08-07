@@ -11771,6 +11771,29 @@ fn send_ack_eliciting_causes_ping(
 }
 
 #[rstest]
+fn scheduled_ack_eliciting_outcome_is_counted(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    let before = pipe.server.stats().scheduled_ack_eliciting_acked;
+    let mut buf = [0; 1500];
+
+    for _ in 0..2 {
+        pipe.server.send_ack_eliciting().unwrap();
+        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        pipe.client_recv(&mut buf[..len]).unwrap();
+    }
+
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    pipe.server_recv(&mut buf[..len]).unwrap();
+
+    let stats = pipe.server.stats();
+    assert_eq!(stats.scheduled_ack_eliciting_acked, before + 2);
+    assert_eq!(stats.scheduled_ack_eliciting_lost, 0);
+}
+
+#[rstest]
 fn send_ack_eliciting_no_ping(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {
