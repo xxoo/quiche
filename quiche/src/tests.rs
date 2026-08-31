@@ -8645,6 +8645,15 @@ fn dgram_multiple_datagrams(
 
     assert_eq!(pipe.server.dgram_recv_queue_len(), 0);
     assert_eq!(pipe.server.dgram_recv_queue_byte_size(), 0);
+
+    assert_eq!(pipe.client.dgram_send(b"drop one"), Ok(()));
+    assert_eq!(pipe.client.dgram_send(b"drop two"), Ok(()));
+    pipe.client.dgram_purge_outgoing(|_| true);
+    assert_eq!(pipe.client.dgram_send_queue_len(), 0);
+    assert_eq!(pipe.client.dgram_send_queue_byte_size(), 0);
+    let shaping_stats = pipe.client.shaping_stats();
+    assert_eq!(shaping_stats.datagram_send_queue_entries, 0);
+    assert_eq!(shaping_stats.datagram_send_queue_bytes, 0);
 }
 
 #[rstest]
@@ -11482,6 +11491,18 @@ fn shaping_stats_use_migrated_path_delivery_rate() {
             .shaping_stats()
             .active_path_delivery_rate_bytes_per_sec,
         1000
+    );
+
+    pipe.client
+        .paths
+        .get_mut(migrated_path_id)
+        .unwrap()
+        .active_dcid_seq = None;
+    assert_eq!(
+        pipe.client
+            .shaping_stats()
+            .active_path_delivery_rate_bytes_per_sec,
+        0
     );
 }
 
