@@ -62,6 +62,7 @@ pub(crate) struct Config {
     pub has_ipv6pktinfo: bool,
     pub(crate) server_config_identity: ServerConfigIdentity,
     server_config_profiles: Vec<ServerProfileConfig>,
+    pub pool_send_buffer: bool,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -108,6 +109,7 @@ impl Config {
             has_ipv6pktinfo,
             server_config_identity: params.server_config_identity(),
             server_config_profiles,
+            pool_send_buffer: quic_settings.pool_send_buffer,
         })
     }
 
@@ -534,7 +536,7 @@ mod tests {
         let profile = config.server_profile_config_mut(Some(0)).unwrap();
         let snapshot = profile.snapshot();
 
-        assert_eq!(snapshot.qlog_dir.as_deref(), Some("/tmp/tokio-quiche-qlog"));
+        assert_eq!(snapshot.qlog_dir, Some("/tmp/tokio-quiche-qlog"));
         assert_eq!(
             snapshot.connection_config.handshake_timeout,
             Some(Duration::from_secs(7))
@@ -589,12 +591,14 @@ mod tests {
         }
 
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut params = ConnectionParams::default();
-        params.tls_cert = Some(TlsCertificatePaths {
-            cert: TEST_CERT_FILE,
-            private_key: TEST_KEY_FILE,
-            kind: CertificateKind::X509,
-        });
+        let mut params = ConnectionParams {
+            tls_cert: Some(TlsCertificatePaths {
+                cert: TEST_CERT_FILE,
+                private_key: TEST_KEY_FILE,
+                kind: CertificateKind::X509,
+            }),
+            ..Default::default()
+        };
         params.hooks.connection_hook =
             Some(Arc::new(RecordingHook(Arc::clone(&calls))));
         params
@@ -633,7 +637,8 @@ mod tests {
 
     #[test]
     fn tls_hook_without_certificate_can_customize_or_fall_back() {
-        struct NoCertificateHook(Arc<Mutex<Vec<(Option<usize>, bool)>>>);
+        type NoCertificateCalls = Arc<Mutex<Vec<(Option<usize>, bool)>>>;
+        struct NoCertificateHook(NoCertificateCalls);
 
         impl ConnectionHook for NoCertificateHook {
             fn create_custom_ssl_context_builder(

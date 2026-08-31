@@ -427,6 +427,7 @@ where
                 self.config.has_ipv6pktinfo
             },
             fixed_peer_ip,
+            pool_send_buffer: self.config.pool_send_buffer,
         };
 
         let handshake_info = HandshakeInfo::new(
@@ -1167,10 +1168,6 @@ mod tests {
 
         fn should_act(&self) -> bool {
             true
-        }
-
-        fn buffer(&mut self) -> &mut [u8] {
-            &mut self.buf
         }
 
         fn wait_for_data(

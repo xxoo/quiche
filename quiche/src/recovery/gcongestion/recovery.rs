@@ -1047,9 +1047,7 @@ impl RecoveryOps for GRecovery {
         (lost_packets, lost_bytes)
     }
 
-    fn track_ack_eliciting_packet(
-        &mut self, pkt_num: u64, epoch: packet::Epoch,
-    ) {
+    fn track_ack_eliciting_packet(&mut self, pkt_num: u64, epoch: packet::Epoch) {
         self.epochs[epoch].tracked_ack_eliciting.insert(pkt_num);
     }
 
@@ -1107,6 +1105,10 @@ impl RecoveryOps for GRecovery {
 
     fn max_bandwidth(&self) -> Option<Bandwidth> {
         Some(self.pacer.max_bandwidth())
+    }
+
+    fn rtt_persistent_jump_count(&self) -> u64 {
+        self.pacer.rtt_persistent_jump_count()
     }
 
     /// Statistics from when a CCA first exited the startup phase.
