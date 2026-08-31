@@ -7932,6 +7932,27 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
+    /// Collects the connection statistics used by traffic shaping.
+    #[inline]
+    pub fn shaping_stats(&self) -> ShapingStats {
+        ShapingStats {
+            recv: self.recv_count,
+            acked: self.acked_count,
+            lost: self.lost_count,
+            scheduled_ack_eliciting_acked: self
+                .scheduled_ack_eliciting_acked_count,
+            scheduled_ack_eliciting_lost: self.scheduled_ack_eliciting_lost_count,
+            active_path_delivery_rate_bytes_per_sec: self
+                .paths
+                .get_active()
+                .map_or(0, |path| {
+                    path.recovery.delivery_rate().to_bytes_per_second()
+                }),
+            datagram_send_queue_entries: self.dgram_send_queue.len(),
+            datagram_send_queue_bytes: self.dgram_send_queue.byte_size(),
+        }
+    }
+
     /// Returns the sum of the durations when each path in the
     /// connection was actively sending bytes or waiting for acks.
     /// Note that this could result in a duration that is longer than
@@ -9451,6 +9472,35 @@ impl std::fmt::Display for AddrTupleFmt {
 
         f.write_fmt(format_args!("src:{src} dst:{dst}"))
     }
+}
+
+/// Statistics used by traffic shaping.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct ShapingStats {
+    /// The number of QUIC packets received.
+    pub recv: usize,
+
+    /// The number of QUIC packets that were acked.
+    pub acked: usize,
+
+    /// The number of QUIC packets that were lost.
+    pub lost: usize,
+
+    /// The number of scheduled ack-eliciting packets that were acked.
+    pub scheduled_ack_eliciting_acked: usize,
+
+    /// The number of scheduled ack-eliciting packets that were lost.
+    pub scheduled_ack_eliciting_lost: usize,
+
+    /// The active path's most recent delivery rate estimate in bytes/s.
+    pub active_path_delivery_rate_bytes_per_sec: u64,
+
+    /// The number of entries in the outgoing DATAGRAM queue.
+    pub datagram_send_queue_entries: usize,
+
+    /// The number of bytes in the outgoing DATAGRAM queue.
+    pub datagram_send_queue_bytes: usize,
 }
 
 /// Statistics about the connection.

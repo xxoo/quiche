@@ -93,11 +93,15 @@ impl<F: BufFactory> DatagramQueue<F> {
     }
 
     pub fn purge<FN: Fn(&[u8]) -> bool>(&mut self, f: FN) {
-        self.queue.retain(|d| !f(d.as_ref()));
-        self.queue_bytes_size = self
-            .queue
-            .iter()
-            .fold(0, |total, d| total + d.as_ref().len());
+        let mut queue_bytes_size = 0;
+        self.queue.retain(|d| {
+            let keep = !f(d.as_ref());
+            if keep {
+                queue_bytes_size += d.as_ref().len();
+            }
+            keep
+        });
+        self.queue_bytes_size = queue_bytes_size;
     }
 
     pub fn is_full(&self) -> bool {

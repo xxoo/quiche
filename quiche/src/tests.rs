@@ -8590,6 +8590,32 @@ fn dgram_multiple_datagrams(
     assert_eq!(pipe.client.dgram_send_queue_byte_size(), 23);
     assert!(!pipe.client.is_dgram_send_queue_full());
 
+    let stats = pipe.client.stats();
+    let shaping_stats = pipe.client.shaping_stats();
+    assert_eq!(shaping_stats.recv, stats.recv);
+    assert_eq!(shaping_stats.acked, stats.acked);
+    assert_eq!(shaping_stats.lost, stats.lost);
+    assert_eq!(
+        shaping_stats.scheduled_ack_eliciting_acked,
+        stats.scheduled_ack_eliciting_acked
+    );
+    assert_eq!(
+        shaping_stats.scheduled_ack_eliciting_lost,
+        stats.scheduled_ack_eliciting_lost
+    );
+    assert_eq!(
+        shaping_stats.active_path_delivery_rate_bytes_per_sec,
+        pipe.client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .delivery_rate()
+            .to_bytes_per_second()
+    );
+    assert_eq!(shaping_stats.datagram_send_queue_entries, 2);
+    assert_eq!(shaping_stats.datagram_send_queue_bytes, 23);
+
     // Before packets exchanged, no dgrams on server receive side.
     assert_eq!(pipe.server.dgram_recv_queue_len(), 0);
 
@@ -11384,6 +11410,79 @@ fn connection_migration(
     assert_eq!(pipe.client.migrate(client_addr_2, server_addr), Ok(1));
     pipe.client.revalidate_pmtu();
     assert_eq!(pipe.client.max_send_udp_payload_size(), 1200);
+}
+
+#[test]
+fn shaping_stats_use_migrated_path_delivery_rate() {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(2);
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    let initial_path_id = pipe.client.paths.get_active_path_id().unwrap();
+    let server_addr = test_utils::Pipe::server_addr();
+    let migrated_addr = "127.0.0.1:5678".parse().unwrap();
+    assert_eq!(pipe.client.migrate(migrated_addr, server_addr), Ok(1));
+    let migrated_path_id = pipe.client.paths.get_active_path_id().unwrap();
+    assert_ne!(migrated_path_id, initial_path_id);
+
+    pipe.client.paths.get_mut(initial_path_id).unwrap().recovery =
+        recovery::Recovery::new(&config);
+    let active_recovery = &mut pipe
+        .client
+        .paths
+        .get_mut(migrated_path_id)
+        .unwrap()
+        .recovery;
+    *active_recovery = recovery::Recovery::new(&config);
+
+    let now = Instant::now();
+    for packet_number in 0..10 {
+        active_recovery.on_packet_sent(
+            test_utils::helper_packet_sent(packet_number, now, 1000),
+            packet::Epoch::Application,
+            recovery::HandshakeStatus::default(),
+            now,
+            "",
+        );
+    }
+    let mut acked = ranges::RangeSet::default();
+    acked.insert(0..10);
+    active_recovery
+        .on_ack_received(
+            &acked,
+            0,
+            packet::Epoch::Application,
+            recovery::HandshakeStatus::default(),
+            now + Duration::from_secs(10),
+            None,
+            "",
+        )
+        .unwrap();
+
+    assert_eq!(
+        pipe.client
+            .paths
+            .get(initial_path_id)
+            .unwrap()
+            .recovery
+            .delivery_rate()
+            .to_bytes_per_second(),
+        0
+    );
+    assert_eq!(
+        pipe.client
+            .shaping_stats()
+            .active_path_delivery_rate_bytes_per_sec,
+        1000
+    );
 }
 
 #[rstest]
