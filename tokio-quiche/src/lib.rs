@@ -124,10 +124,19 @@ pub mod socket;
 pub use datagram_socket;
 
 use foundations::telemetry::settings::LogVerbosity;
+use futures::Stream;
+use std::error::Error;
+use std::fmt;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Once;
+use std::task::Context;
+use std::task::Poll;
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::metrics::Metrics;
@@ -156,8 +165,242 @@ pub use crate::result::QuicResultExt;
 ///
 /// Errors from processing the client's QUIC initials can also be emitted on
 /// this stream. These do not indicate that the listener itself has failed.
-pub type QuicConnectionStream<M> =
-    ReceiverStream<io::Result<InitialQuicConnection<UdpSocket, M>>>;
+pub struct QuicConnectionStream<M>
+where
+    M: Metrics,
+{
+    incoming: ReceiverStream<io::Result<InitialQuicConnection<UdpSocket, M>>>,
+    listener_task: Option<JoinHandle<io::Result<()>>>,
+    terminal_result: Option<QuicListenerTaskResult>,
+    terminated: bool,
+}
+
+/// The terminal result of a QUIC listener task.
+///
+/// This result becomes available only after its [`QuicConnectionStream`] has
+/// returned `None`. Errors yielded before then apply to individual QUIC
+/// initials and are not listener failures.
+#[derive(Debug)]
+pub enum QuicListenerTaskResult {
+    /// The listener task exited without an error.
+    Completed,
+
+    /// The listener task returned an I/O error.
+    Failed(io::Error),
+
+    /// The listener task was cancelled.
+    Cancelled {
+        /// The runtime-local task identifier.
+        task_id: tokio::task::Id,
+    },
+
+    /// The listener task panicked.
+    Panicked {
+        /// The runtime-local task identifier.
+        task_id: tokio::task::Id,
+    },
+
+    /// The listener task failed for an unclassified join reason.
+    JoinFailed {
+        /// The runtime-local task identifier.
+        task_id: tokio::task::Id,
+    },
+}
+
+impl fmt::Display for QuicListenerTaskResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Completed => f.write_str("listener task completed"),
+            Self::Failed(error) => {
+                write!(f, "listener task failed: {error}")
+            },
+            Self::Cancelled { task_id } => {
+                write!(f, "listener task {task_id} was cancelled")
+            },
+            Self::Panicked { task_id } => {
+                write!(f, "listener task {task_id} panicked")
+            },
+            Self::JoinFailed { task_id } => {
+                write!(f, "listener task {task_id} join failed")
+            },
+        }
+    }
+}
+
+impl Error for QuicListenerTaskResult {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl<M> QuicConnectionStream<M>
+where
+    M: Metrics,
+{
+    pub(crate) fn new(
+        incoming: mpsc::Receiver<io::Result<InitialQuicConnection<UdpSocket, M>>>,
+        listener_task: JoinHandle<io::Result<()>>,
+    ) -> Self {
+        Self {
+            incoming: ReceiverStream::new(incoming),
+            listener_task: Some(listener_task),
+            terminal_result: None,
+            terminated: false,
+        }
+    }
+
+    /// Takes the listener task's result after this stream has returned `None`.
+    pub fn take_terminal_result(&mut self) -> Option<QuicListenerTaskResult> {
+        if !self.terminated {
+            return None;
+        }
+
+        self.terminal_result.take()
+    }
+
+    /// Receives the next accepted connection or per-Initial error.
+    pub async fn recv(
+        &mut self,
+    ) -> Option<io::Result<InitialQuicConnection<UdpSocket, M>>> {
+        futures::StreamExt::next(self).await
+    }
+
+    fn poll_listener_task(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.terminal_result.is_some() {
+            return Poll::Ready(());
+        }
+
+        let Some(listener_task) = self.listener_task.as_mut() else {
+            return Poll::Ready(());
+        };
+
+        let result = match Pin::new(listener_task).poll(cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => return Poll::Pending,
+        };
+
+        self.listener_task = None;
+        self.terminal_result = Some(match result {
+            Ok(Ok(())) => QuicListenerTaskResult::Completed,
+            Ok(Err(error)) => QuicListenerTaskResult::Failed(error),
+            Err(error) if error.is_cancelled() => {
+                QuicListenerTaskResult::Cancelled {
+                    task_id: error.id(),
+                }
+            },
+            Err(error) if error.is_panic() => QuicListenerTaskResult::Panicked {
+                task_id: error.id(),
+            },
+            Err(error) => QuicListenerTaskResult::JoinFailed {
+                task_id: error.id(),
+            },
+        });
+
+        Poll::Ready(())
+    }
+}
+
+impl<M> Stream for QuicConnectionStream<M>
+where
+    M: Metrics,
+{
+    type Item = io::Result<InitialQuicConnection<UdpSocket, M>>;
+
+    fn poll_next(
+        self: Pin<&mut Self>, cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        match Pin::new(&mut this.incoming).poll_next(cx) {
+            Poll::Ready(Some(incoming)) => Poll::Ready(Some(incoming)),
+            Poll::Ready(None) => match this.poll_listener_task(cx) {
+                Poll::Ready(()) => {
+                    this.terminated = true;
+                    Poll::Ready(None)
+                },
+                Poll::Pending => Poll::Pending,
+            },
+            Poll::Pending => match this.poll_listener_task(cx) {
+                Poll::Ready(()) => {
+                    match Pin::new(&mut this.incoming).poll_next(cx) {
+                        Poll::Ready(None) => {
+                            this.terminated = true;
+                            Poll::Ready(None)
+                        },
+                        incoming => incoming,
+                    }
+                },
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod listener_stream_tests {
+    use super::*;
+    use crate::metrics::DefaultMetrics;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn separates_initial_errors_from_listener_failure() {
+        let (sender, incoming) = mpsc::channel::<
+            io::Result<InitialQuicConnection<UdpSocket, DefaultMetrics>>,
+        >(1);
+        assert!(sender
+            .send(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid initial",
+            )))
+            .await
+            .is_ok());
+        drop(sender);
+
+        let listener_task = tokio::spawn(async {
+            Err::<(), _>(io::Error::from_raw_os_error(13))
+        });
+        let mut stream = QuicConnectionStream::new(incoming, listener_task);
+
+        let Some(Err(initial_error)) = stream.next().await else {
+            panic!("missing initial error");
+        };
+        assert_eq!(initial_error.kind(), io::ErrorKind::InvalidData);
+        assert!(stream.take_terminal_result().is_none());
+
+        assert!(stream.next().await.is_none());
+        let Some(QuicListenerTaskResult::Failed(listener_error)) =
+            stream.take_terminal_result()
+        else {
+            panic!("missing listener failure");
+        };
+        assert_eq!(listener_error.raw_os_error(), Some(13));
+    }
+
+    #[tokio::test]
+    async fn ready_listener_task_does_not_spin_while_sender_is_open() {
+        let (sender, incoming) = mpsc::channel::<
+            io::Result<InitialQuicConnection<UdpSocket, DefaultMetrics>>,
+        >(1);
+        let listener_task = tokio::spawn(async { Ok(()) });
+        while !listener_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut stream = QuicConnectionStream::new(incoming, listener_task);
+
+        assert!(futures::poll!(stream.next()).is_pending());
+        assert!(stream.take_terminal_result().is_none());
+
+        drop(sender);
+        assert!(stream.next().await.is_none());
+        assert!(matches!(
+            stream.take_terminal_result(),
+            Some(QuicListenerTaskResult::Completed)
+        ));
+    }
+}
 
 /// Starts listening for inbound QUIC connections on the given
 /// [`QuicListener`]s.
