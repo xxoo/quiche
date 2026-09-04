@@ -38,7 +38,6 @@ use crate::recovery::INITIAL_PACKET_THRESHOLD;
 use crate::recovery::INITIAL_TIME_THRESHOLD;
 use crate::recovery::MAX_OUTSTANDING_NON_ACK_ELICITING;
 use crate::recovery::MAX_PACKET_THRESHOLD;
-use crate::recovery::MAX_PTO_EXPONENT;
 use crate::recovery::MAX_PTO_PROBES_COUNT;
 use crate::recovery::PACKET_REORDER_TIME_THRESHOLD;
 
@@ -614,8 +613,7 @@ impl GRecovery {
     fn pto_time_and_space(
         &self, handshake_status: HandshakeStatus, now: Instant,
     ) -> (Option<Instant>, packet::Epoch) {
-        let mut duration =
-            self.pto() * 2_u32.pow(self.pto_count.min(MAX_PTO_EXPONENT));
+        let mut duration = self.pto() * 2_u32.saturating_pow(self.pto_count);
 
         // Arm PTO from now when there are no inflight packets.
         if self.bytes_in_flight.is_zero() {
@@ -645,7 +643,7 @@ impl GRecovery {
 
                 // Include max_ack_delay and backoff for Application Data.
                 duration += self.rtt_stats.max_ack_delay *
-                    2_u32.pow(self.pto_count.min(MAX_PTO_EXPONENT));
+                    2_u32.saturating_pow(self.pto_count);
             }
 
             let new_time = self.epochs[e]
@@ -1073,6 +1071,10 @@ impl RecoveryOps for GRecovery {
         Some(self.pacer.max_bandwidth())
     }
 
+    fn rtt_persistent_jump_count(&self) -> u64 {
+        self.pacer.rtt_persistent_jump_count()
+    }
+
     /// Statistics from when a CCA first exited the startup phase.
     fn startup_exit(&self) -> Option<StartupExit> {
         self.recovery_stats.startup_exit
@@ -1345,8 +1347,8 @@ mod tests {
         for subsequent_loss_count in 1..100 {
             // Double the overhead until it caps at `2.0`.
             //
-            // It takes `3` rounds of doubling for INITIAL_TIME_THRESHOLD_OVERHEAD
-            // to equal `1.0`.
+            // The initial time-threshold overhead reaches `1.0` after three
+            // rounds of doubling.
             let new_time_threshold = if subsequent_loss_count <= 3 {
                 1.0 + INITIAL_TIME_THRESHOLD_OVERHEAD *
                     2_f64.powi(subsequent_loss_count as i32)

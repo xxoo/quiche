@@ -528,12 +528,10 @@ impl Path {
     /// packets, and it is still OK to fully reinitialize the recovery module to
     /// pickup changes to congestion control config.
     pub fn can_reinit_recovery(&self) -> bool {
-        // The recovery module can be reinitialized until the connection attempts
-        // to send a packet with inflight data. The congestion
-        // controller doesn't track anything interesting until inflight
-        // data is sent. Handshake ACKs may be sent prior to arrival of
-        // the full ClientHello, but the send of ACK only packets
-        // shouldn't prevent the reinit of the recovery module.
+        // Recovery can be reinitialized until the connection sends in-flight
+        // data. The congestion controller has no relevant state before then.
+        // ACK-only packets sent before the full ClientHello arrives should not
+        // prevent reinitialization.
         self.recovery.bytes_in_flight() == 0 &&
             self.recovery.bytes_in_flight_duration() == Duration::ZERO
     }
@@ -579,6 +577,7 @@ impl Path {
                 .recovery
                 .max_bandwidth()
                 .map(Bandwidth::to_bytes_per_second),
+            rtt_persistent_jump_count: self.recovery.rtt_persistent_jump_count(),
             startup_exit: self.recovery.startup_exit(),
         }
     }
@@ -639,7 +638,8 @@ impl PathMap {
     pub fn new(
         mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
     ) -> Self {
-        let mut paths = Slab::with_capacity(1); // most connections only have one path
+        // Most connections only have one path.
+        let mut paths = Slab::with_capacity(1);
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -1020,6 +1020,9 @@ pub struct PathStats {
     /// it is currently only implemented for bbr2_gcongestion.
     pub max_bandwidth: Option<u64>,
 
+    /// The total number of confirmed persistent RTT jump episodes.
+    pub rtt_persistent_jump_count: u64,
+
     /// Statistics from when a CCA first exited the startup phase.
     pub startup_exit: Option<StartupExit>,
 }
@@ -1051,8 +1054,11 @@ impl std::fmt::Debug for PathStats {
 
         write!(
             f,
-            " stream_retrans_bytes={} pmtu={} delivery_rate={}",
-            self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
+            " stream_retrans_bytes={} pmtu={} delivery_rate={} rtt_persistent_jump_count={}",
+            self.stream_retrans_bytes,
+            self.pmtu,
+            self.delivery_rate,
+            self.rtt_persistent_jump_count,
         )
     }
 }
@@ -1103,8 +1109,7 @@ mod tests {
         assert!(path_mgr.get_mut(pid).unwrap().validation_requested());
         assert!(path_mgr.get_mut(pid).unwrap().probing_required());
 
-        // Fake sending of PathChallenge in a packet of MIN_CLIENT_INITIAL_LEN - 1
-        // bytes.
+        // Send `PathChallenge` one byte below `MIN_CLIENT_INITIAL_LEN`.
         let data = rand::rand_u64().to_be_bytes();
         path_mgr.get_mut(pid).unwrap().add_challenge_sent(
             data,

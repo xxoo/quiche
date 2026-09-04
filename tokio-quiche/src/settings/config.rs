@@ -56,6 +56,7 @@ pub(crate) struct Config {
     pub handshake_timeout: Option<Duration>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
+    pub pool_send_buffer: bool,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -75,7 +76,9 @@ impl Config {
         };
         let keylog_file = keylog_path.and_then(|path| if KEYLOGFILE_ENABLED {
                 File::options().create(true).append(true).open(path)
-                    .inspect_err(|e| log::warn!("failed to open SSLKEYLOGFILE"; "error" => e))
+                    .inspect_err(|e| {
+                        log::warn!("failed to open SSLKEYLOGFILE"; "error" => e);
+                    })
                     .ok()
             } else {
                 log::warn!("SSLKEYLOGFILE is set, but `--cfg capture_keylogs` was not enabled. No keys will be logged.");
@@ -108,6 +111,7 @@ impl Config {
             handshake_timeout: quic_settings.handshake_timeout,
             has_ippktinfo,
             has_ipv6pktinfo,
+            pool_send_buffer: quic_settings.pool_send_buffer,
         })
     }
 }
@@ -190,9 +194,6 @@ fn make_quiche_config(
 
     config.set_max_connection_window(quic_settings.max_connection_window);
     config.set_max_stream_window(quic_settings.max_stream_window);
-    config.set_use_initial_max_data_as_flow_control_win(
-        quic_settings.use_initial_max_data_as_fc_window,
-    );
     config.set_enable_send_streams_blocked(
         quic_settings.enable_send_streams_blocked,
     );
@@ -235,7 +236,7 @@ fn quiche_config_with_tls(
     match tls.kind {
         #[cfg(not(feature = "rpk"))]
         CertificateKind::RawPublicKey => {
-            // TODO: don't compile this enum variant unless rpk feature is enabled
+            // TODO: Gate this variant on the `rpk` feature.
             panic!("Can't use RPK when compiled without rpk feature");
         },
         #[cfg(feature = "rpk")]
