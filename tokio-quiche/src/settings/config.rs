@@ -857,7 +857,7 @@ mod tests {
                 self.calls.lock().unwrap().push(profile_index);
 
                 let mut builder = boring::ssl::SslContextBuilder::new(
-                    boring::ssl::SslMethod::tls_client(),
+                    boring::ssl::SslMethod::tls(),
                 )?;
                 builder.cert_store_mut().set_flags(
                     boring::x509::verify::X509VerifyFlags::PARTIAL_CHAIN,

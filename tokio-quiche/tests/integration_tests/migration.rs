@@ -30,6 +30,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
+use tokio::time::Instant;
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::ClientH3Controller;
 use tokio_quiche::http3::driver::ClientH3Driver;
@@ -301,10 +303,11 @@ pub(crate) async fn run_migration_test(
             .unwrap();
     }
 
-    // Handshake.
+    // One deadline bounds the whole handshake, including retransmissions.
+    let deadline = Instant::now() + Duration::from_secs(5);
     while !conn.is_established() {
-        emit_flight(&socket, &mut conn).await;
-        process_flight(&socket, client_addr, &mut conn).await;
+        emit_flight(&socket, &mut conn, deadline).await;
+        process_flight(&socket, client_addr, &mut conn, deadline).await;
     }
 
     // Create a new HTTP/3 connection once the QUIC connection is established.
@@ -312,20 +315,33 @@ pub(crate) async fn run_migration_test(
     let mut h3_conn =
         quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
 
-    // Client sends first request on the initial path.
+    // The echo body exceeds the client's initial 1500-byte flow-control
+    // window. Completing it must receive multiple flights and flush new credit.
+    let request_path = format!("/{}", "x".repeat(2048));
     let req = vec![
         quiche::h3::Header::new(b":method", b"GET"),
         quiche::h3::Header::new(b":scheme", b"https"),
         quiche::h3::Header::new(b":authority", b"test.com"),
-        quiche::h3::Header::new(b":path", b"/"),
+        quiche::h3::Header::new(b":path", request_path.as_bytes()),
         quiche::h3::Header::new(b"user-agent", b"quiche"),
     ];
 
-    h3_conn.send_request(&mut conn, &req, true).unwrap();
-    emit_flight(&socket, &mut conn).await;
-    process_flight(&socket, client_addr, &mut conn).await;
-
-    assert_eq!(process_h3_events(&mut h3_conn, &mut conn), (true, true));
+    // Client sends first request on the initial path.
+    let stream_id = h3_conn.send_request(&mut conn, &req, true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    emit_flight(&socket, &mut conn, deadline).await;
+    let (got_headers, finished, body, flights) = process_h3_events(
+        &socket,
+        client_addr,
+        &mut h3_conn,
+        &mut conn,
+        stream_id,
+        deadline,
+    )
+    .await;
+    assert_eq!((got_headers, finished), (true, true));
+    assert_eq!(body, format!("{stream_id},GET {request_path}|").as_bytes());
+    assert!(flights > 1, "response must span multiple network flights");
 
     // Client migrates to new address.
     let migrated_addr = SocketAddr::new(client_addr.ip(), base_port + 1);
@@ -345,31 +361,45 @@ pub(crate) async fn run_migration_test(
     };
 
     // Client sends second request on the new address.
-    h3_conn.send_request(&mut conn, &req, true).unwrap();
-    emit_flight(&migrated_socket, &mut conn).await;
+    let stream_id = h3_conn.send_request(&mut conn, &req, true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    emit_flight(&migrated_socket, &mut conn, deadline).await;
 
     let stats = conn.stats();
     assert_eq!(stats.path_challenge_rx_count, 0);
 
-    process_flight(&migrated_socket, client_addr, &mut conn).await;
+    process_flight(&migrated_socket, client_addr, &mut conn, deadline).await;
 
     let stats = conn.stats();
     assert_eq!(stats.path_challenge_rx_count, 1);
 
     // Client responds to PATH_CHALLENGE.
-    emit_flight(&migrated_socket, &mut conn).await;
+    emit_flight(&migrated_socket, &mut conn, deadline).await;
 
-    // Client receives response for the second request.
-    process_flight(&migrated_socket, client_addr, &mut conn).await;
-
-    assert_eq!(process_h3_events(&mut h3_conn, &mut conn), (true, true));
+    // Receive the complete second response even when it spans several flights.
+    let (got_headers, finished, body, _) = process_h3_events(
+        &migrated_socket,
+        client_addr,
+        &mut h3_conn,
+        &mut conn,
+        stream_id,
+        deadline,
+    )
+    .await;
+    assert_eq!((got_headers, finished), (true, true));
+    assert_eq!(body, format!("{stream_id},GET {request_path}|").as_bytes());
 
     (hook.path_events(), server_addr, migrated_addr)
 }
 
 async fn emit_flight(
     socket: &tokio::net::UdpSocket, conn: &mut quiche::Connection,
+    deadline: Instant,
 ) {
+    assert!(
+        Instant::now() < deadline,
+        "migration flight deadline expired"
+    );
     let flight = match quiche::test_utils::emit_flight(conn) {
         Ok(v) => v,
 
@@ -382,60 +412,116 @@ async fn emit_flight(
         // We avoid using the `from` field here on purpose, as in case of
         // passive migration the client might be unaware that their address
         // changed.
-        socket.send_to(&p.0, p.1.to).await.unwrap();
+        timeout_at(deadline, socket.send_to(&p.0, p.1.to))
+            .await
+            .expect("migration flight send timed out")
+            .unwrap();
     }
 }
 
 async fn process_flight(
     socket: &tokio::net::UdpSocket, client_addr: std::net::SocketAddr,
-    conn: &mut quiche::Connection,
+    conn: &mut quiche::Connection, deadline: Instant,
 ) {
     let mut buf = [0; 65535];
 
-    socket.readable().await.unwrap();
-
     loop {
-        let (len, from) = match socket.try_recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => panic!("failed to receive packets: {e:?}"),
-        };
+        assert!(
+            Instant::now() < deadline,
+            "migration flight receive timed out"
+        );
+        assert!(
+            !conn.is_closed(),
+            "QUIC connection closed before the response"
+        );
+        let transport_deadline = conn
+            .timeout_instant()
+            .map(Instant::from_std)
+            .unwrap_or(deadline)
+            .min(deadline);
+        match timeout_at(transport_deadline, socket.readable()).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "migration flight receive timed out"
+                );
+                conn.on_timeout();
+                emit_flight(socket, conn, deadline).await;
+                continue;
+            },
+        }
 
-        // We use an explicit `client_addr` here rather than the socket's
-        // address to simulate cases where the client is not aware of its own
-        // address changing during passive migration.
-        let recv_info = quiche::RecvInfo {
-            to: client_addr,
-            from,
-        };
+        let mut received = false;
+        loop {
+            let (len, from) = match socket.try_recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("failed to receive packets: {e:?}"),
+            };
 
-        // Process potentially coalesced packets.
-        let _ = conn.recv(&mut buf[..len], recv_info).unwrap();
+            // Preserve the original local address during passive migration to
+            // emulate a client that cannot observe its NAT rebinding.
+            let recv_info = quiche::RecvInfo {
+                to: client_addr,
+                from,
+            };
+
+            conn.recv(&mut buf[..len], recv_info).unwrap();
+            received = true;
+        }
+        if received {
+            return;
+        }
     }
 }
 
-fn process_h3_events(
+async fn process_h3_events(
+    socket: &tokio::net::UdpSocket, client_addr: SocketAddr,
     h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection,
-) -> (bool, bool) {
+    expected_stream_id: u64, deadline: Instant,
+) -> (bool, bool, Vec<u8>, usize) {
     let mut buf = [0; 65535];
-
     let mut got_headers = false;
+    let mut body = Vec::new();
+    let mut flights = 0;
 
     loop {
+        assert!(Instant::now() < deadline, "HTTP/3 response timed out");
         match h3_conn.poll(conn) {
-            Ok((_, quiche::h3::Event::Headers { .. })) => got_headers = true,
+            Ok((stream_id, quiche::h3::Event::Headers { .. })) => {
+                assert_eq!(stream_id, expected_stream_id);
+                got_headers = true;
+            },
 
             Ok((stream_id, quiche::h3::Event::Data)) => {
-                // Drain stream and drop the data.
-                while h3_conn.recv_body(conn, stream_id, &mut buf).is_ok() {}
+                assert_eq!(stream_id, expected_stream_id);
+                loop {
+                    match h3_conn.recv_body(conn, stream_id, &mut buf) {
+                        Ok(len) => body.extend_from_slice(&buf[..len]),
+                        Err(quiche::h3::Error::Done) => break,
+                        Err(error) =>
+                            panic!("failed to receive HTTP/3 body: {error:?}"),
+                    }
+                }
             },
 
-            Ok((_, quiche::h3::Event::Finished)) => {
-                // Request is complete, return.
-                return (got_headers, true);
+            Ok((stream_id, quiche::h3::Event::Finished)) => {
+                assert_eq!(stream_id, expected_stream_id);
+                return (got_headers, true, body, flights);
             },
 
-            _ => {},
+            Err(quiche::h3::Error::Done) => {
+                // Incomplete responses need more network input. Flush ACKs and
+                // the receive credit released while draining the current body.
+                emit_flight(socket, conn, deadline).await;
+                process_flight(socket, client_addr, conn, deadline).await;
+                flights += 1;
+            },
+
+            Err(error) => panic!("failed to poll HTTP/3 response: {error:?}"),
+            Ok((_, event)) =>
+                panic!("unexpected HTTP/3 response event: {event:?}"),
         }
     }
 }

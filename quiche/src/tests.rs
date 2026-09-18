@@ -5254,12 +5254,13 @@ fn recv_udp_payload_size_cap_handles_coalesced_packets() {
     let mut buf = [0; 65535];
     let mut pipe = test_utils::Pipe::new("bbr2_gcongestion").unwrap();
 
-    let (len, _) = pipe.client.send(&mut buf).unwrap();
-    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
-    let (len, _) = pipe.server.send(&mut buf).unwrap();
-    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
-    let (len, _) = pipe.server.send(&mut buf).unwrap();
-    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+    // A flight can contain multiple datagrams, for example when post-quantum
+    // key shares enlarge the ClientHello. Deliver both flights completely,
+    // leaving the client's Finished pending for coalescing with STREAM data.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(test_utils::process_flight(&mut pipe.server, flight), Ok(()));
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert_eq!(test_utils::process_flight(&mut pipe.client, flight), Ok(()));
 
     assert!(pipe.client.is_established());
     assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));

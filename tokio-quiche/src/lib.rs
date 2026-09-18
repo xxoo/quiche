@@ -338,69 +338,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod listener_stream_tests {
-    use super::*;
-    use crate::metrics::DefaultMetrics;
-    use futures::StreamExt;
-
-    #[tokio::test]
-    async fn separates_initial_errors_from_listener_failure() {
-        let (sender, incoming) = mpsc::channel::<
-            io::Result<InitialQuicConnection<UdpSocket, DefaultMetrics>>,
-        >(1);
-        assert!(sender
-            .send(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid initial",
-            )))
-            .await
-            .is_ok());
-        drop(sender);
-
-        let listener_task = tokio::spawn(async {
-            Err::<(), _>(io::Error::from_raw_os_error(13))
-        });
-        let mut stream = QuicConnectionStream::new(incoming, listener_task);
-
-        let Some(Err(initial_error)) = stream.next().await else {
-            panic!("missing initial error");
-        };
-        assert_eq!(initial_error.kind(), io::ErrorKind::InvalidData);
-        assert!(stream.take_terminal_result().is_none());
-
-        assert!(stream.next().await.is_none());
-        let Some(QuicListenerTaskResult::Failed(listener_error)) =
-            stream.take_terminal_result()
-        else {
-            panic!("missing listener failure");
-        };
-        assert_eq!(listener_error.raw_os_error(), Some(13));
-    }
-
-    #[tokio::test]
-    async fn ready_listener_task_does_not_spin_while_sender_is_open() {
-        let (sender, incoming) = mpsc::channel::<
-            io::Result<InitialQuicConnection<UdpSocket, DefaultMetrics>>,
-        >(1);
-        let listener_task = tokio::spawn(async { Ok(()) });
-        while !listener_task.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        let mut stream = QuicConnectionStream::new(incoming, listener_task);
-
-        assert!(futures::poll!(stream.next()).is_pending());
-        assert!(stream.take_terminal_result().is_none());
-
-        drop(sender);
-        assert!(stream.next().await.is_none());
-        assert!(matches!(
-            stream.take_terminal_result(),
-            Some(QuicListenerTaskResult::Completed)
-        ));
-    }
-}
-
 /// Starts listening for inbound QUIC connections on the given
 /// [`QuicListener`]s.
 ///
@@ -495,4 +432,67 @@ pub(crate) fn capture_quiche_logs() {
         // logger, so retain the guard for the process lifetime.
         let _scope_guard = std::mem::ManuallyDrop::new(scope_guard);
     });
+}
+
+#[cfg(test)]
+mod listener_stream_tests {
+    use super::*;
+    use crate::metrics::DefaultMetrics;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn separates_initial_errors_from_listener_failure() {
+        let (sender, incoming) = mpsc::channel::<
+            io::Result<InitialQuicConnection<UdpSocket, DefaultMetrics>>,
+        >(1);
+        assert!(sender
+            .send(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid initial",
+            )))
+            .await
+            .is_ok());
+        drop(sender);
+
+        let listener_task = tokio::spawn(async {
+            Err::<(), _>(io::Error::from_raw_os_error(13))
+        });
+        let mut stream = QuicConnectionStream::new(incoming, listener_task);
+
+        let Some(Err(initial_error)) = stream.next().await else {
+            panic!("missing initial error");
+        };
+        assert_eq!(initial_error.kind(), io::ErrorKind::InvalidData);
+        assert!(stream.take_terminal_result().is_none());
+
+        assert!(stream.next().await.is_none());
+        let Some(QuicListenerTaskResult::Failed(listener_error)) =
+            stream.take_terminal_result()
+        else {
+            panic!("missing listener failure");
+        };
+        assert_eq!(listener_error.raw_os_error(), Some(13));
+    }
+
+    #[tokio::test]
+    async fn ready_listener_task_does_not_spin_while_sender_is_open() {
+        let (sender, incoming) = mpsc::channel::<
+            io::Result<InitialQuicConnection<UdpSocket, DefaultMetrics>>,
+        >(1);
+        let listener_task = tokio::spawn(async { Ok(()) });
+        while !listener_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut stream = QuicConnectionStream::new(incoming, listener_task);
+
+        assert!(futures::poll!(stream.next()).is_pending());
+        assert!(stream.take_terminal_result().is_none());
+
+        drop(sender);
+        assert!(stream.next().await.is_none());
+        assert!(matches!(
+            stream.take_terminal_result(),
+            Some(QuicListenerTaskResult::Completed)
+        ));
+    }
 }
