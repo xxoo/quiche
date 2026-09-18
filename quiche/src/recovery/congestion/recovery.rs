@@ -1058,7 +1058,7 @@ impl RecoveryOps for LegacyRecovery {
         self.epochs[epoch].test_largest_sent_pkt_num_on_path
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qlog"))]
     fn app_limited(&self) -> bool {
         self.congestion.app_limited
     }
@@ -1097,6 +1097,7 @@ impl RecoveryOps for LegacyRecovery {
             lost_packets: Some(self.congestion.lost_count as u64),
             lost_bytes: Some(self.bytes_lost),
             pto_count: Some(self.pto_count),
+            app_limited: Some(self.app_limited()),
             ..Default::default()
         };
 

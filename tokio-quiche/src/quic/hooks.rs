@@ -24,6 +24,7 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use crate::quic::QuicheConnection;
 use crate::settings::TlsCertificatePaths;
 use boring::ssl::SslContextBuilder;
 use quiche::ConnectionId;
@@ -116,6 +117,16 @@ pub trait ConnectionHook {
         &self, _profile_index: Option<usize>,
     ) -> bool {
         false
+    }
+
+    /// Called when the QUIC connection reports a path-specific event.
+    ///
+    /// This runs synchronously on the connection's I/O worker and must not
+    /// block. Applications that need asynchronous processing should copy the
+    /// event into a non-blocking channel.
+    fn on_path_event(
+        &self, _qconn: &mut QuicheConnection, _event: &quiche::PathEvent,
+    ) {
     }
 }
 

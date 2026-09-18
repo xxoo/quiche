@@ -495,8 +495,8 @@ fn main() {
                 let conn = &mut client.conn;
                 let partial_responses = &mut client.partial_responses;
 
-                // Visit all writable response streams to send any remaining HTTP
-                // content.
+                // Visit all writable response streams to send any remaining
+                // HTTP content.
                 for stream_id in writable_response_streams(conn) {
                     http_conn.handle_writable(conn, partial_responses, stream_id);
                 }
@@ -540,7 +540,7 @@ fn main() {
         // packets to be sent.
         continue_write = false;
         for client in clients.values_mut() {
-            // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
+            // Reduce `max_send_burst` by 25% when loss rises by more than 0.1%.
             let stats = client.conn.stats();
             let finished = stats.acked.saturating_add(stats.lost);
             let loss_rate = if finished == 0 {
@@ -548,7 +548,6 @@ fn main() {
             } else {
                 stats.lost as f64 / finished as f64
             };
-
             if loss_rate > client.loss_rate + 0.001 {
                 client.max_send_burst = client.max_send_burst / 4 * 3;
                 // Minimum bound of 10xMSS.
@@ -769,6 +768,16 @@ fn handle_path_events(client: &mut Client) {
                     peer_addr
                 );
             },
+
+            quiche::PathEvent::PmtuUpdated { local, peer, pmtu } => info!(
+                "{} Path ({}, {}) validated PMTU {}",
+                client.conn.trace_id(),
+                local,
+                peer,
+                pmtu
+            ),
+
+            _ => (),
         }
     }
 }
