@@ -5656,14 +5656,15 @@ impl<F: BufFactory> Connection<F> {
 
     /// Returns the maximum pacing into the future.
     ///
-    /// Equals 1/8 of the smoothed RTT, but at least 1ms and not greater than
-    /// 5ms.
+    /// Equals 1/8 of the smoothed RTT, but at least 2ms and not greater than
+    /// 5ms. The minimum accommodates asynchronous timers that round both the
+    /// deadline and the subsequent sleep duration to milliseconds.
     pub fn max_release_into_future(&self) -> Duration {
         self.paths
             .get_active()
             .map(|p| p.recovery.rtt().mul_f64(0.125))
-            .unwrap_or(Duration::from_millis(1))
-            .max(Duration::from_millis(1))
+            .unwrap_or(Duration::from_millis(2))
+            .max(Duration::from_millis(2))
             .min(Duration::from_millis(5))
     }
 

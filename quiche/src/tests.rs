@@ -483,6 +483,34 @@ fn change_max_pacing_rate(
 }
 
 #[rstest]
+#[case(200, 2_000)]
+#[case(8_000, 2_000)]
+#[case(15_992, 2_000)]
+#[case(16_000, 2_000)]
+#[case(16_008, 2_001)]
+#[case(24_000, 3_000)]
+#[case(39_992, 4_999)]
+#[case(40_000, 5_000)]
+#[case(80_000, 5_000)]
+fn pacing_release_horizon_covers_timer_rounding(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[case] rtt_micros: u64, #[case] horizon_micros: u64,
+) {
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    let rtt = Duration::from_micros(rtt_micros);
+    config.set_initial_rtt(rtt);
+    let pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+
+    // No handshake, sleeps or ACK scheduling can change the configured RTT.
+    // Exercise the timer floor, the RTT-scaled range and the unchanged cap.
+    assert_eq!(pipe.client.paths.get_active().unwrap().recovery.rtt(), rtt);
+    assert_eq!(
+        pipe.client.max_release_into_future(),
+        Duration::from_micros(horizon_micros)
+    );
+}
+
+#[rstest]
 fn handshake(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
