@@ -309,3 +309,65 @@ impl Pacer {
         !self.pacing_limited && self.sender.is_cwnd_limited(bytes_in_flight)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn capped_release_clock_bounds_zero_inflight_and_app_limited_sends(
+        #[values(10, 128)] initial_window: usize, #[values(1, 8)] mbps: u64,
+    ) {
+        let rtt = RttStats::new(Duration::from_micros(200), Duration::ZERO);
+        let sender =
+            BBRv2::new(initial_window, 10_000, 1200, rtt.smoothed_rtt, None);
+        let mut pacer = Pacer::new(true, sender, None);
+        let rate = Bandwidth::from_mbits_per_second(mbps);
+        pacer.set_max_pacing_rate(rate, &rtt);
+        let start = Instant::now();
+        let mut now = start;
+        let mut packet_number = 0;
+        let packets = 128;
+
+        // This isolated clock test supplies zero bytes in flight; encrypted
+        // pairs separately cover actual ACK feedback and quiescence. Zero
+        // in-flight input must not repeatedly refill an unlimited allowance.
+        for _ in 0..packets {
+            now = pacer.get_next_release_time().time(now).unwrap_or(now);
+            pacer.on_packet_sent(now, 0, packet_number, 1200, true, &rtt);
+            packet_number += 1;
+        }
+        // The existing initial allowance is ten packets, independent of the
+        // initial congestion window. The final packet's serialization follows
+        // its release, hence one further packet in the finite-window bound.
+        let paced_packets = packets - INITIAL_UNPACED_BURST - 1;
+        assert_eq!(
+            now.duration_since(start),
+            rate.transfer_time((paced_packets * 1200) as u64)
+        );
+
+        // Exercise idle/application-limited restart and both directions of a
+        // rate change. No idle credit accumulates into a fresh unpaced flight.
+        for next_mbps in [1, 8, 1] {
+            pacer.on_app_limited(0);
+            now += Duration::from_secs(1);
+            let phase_start = now;
+            let next_rate = Bandwidth::from_mbits_per_second(next_mbps);
+            pacer.set_max_pacing_rate(next_rate, &rtt);
+            pacer.update_mss(1450);
+            for _ in 0..packets {
+                now = pacer.get_next_release_time().time(now).unwrap_or(now);
+                pacer.on_packet_sent(now, 0, packet_number, 1450, true, &rtt);
+                packet_number += 1;
+            }
+            assert_eq!(
+                now.duration_since(phase_start),
+                next_rate.transfer_time(((packets - 1) * 1450) as u64)
+            );
+        }
+    }
+}

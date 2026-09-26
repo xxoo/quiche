@@ -823,7 +823,10 @@ impl CongestionControl for BBRv2 {
     }
 
     fn limit_cwnd(&mut self, max_cwnd: usize) {
-        self.cwnd_limits.hi = max_cwnd
+        // A pacing-rate BDP can be smaller than one packet on low-RTT or
+        // low-rate paths. Keep the controller's minimum window so complete
+        // packets remain sendable; the pacer still enforces the rate limit.
+        self.cwnd_limits.hi = max_cwnd.max(self.cwnd_limits.lo);
     }
 }
 
@@ -832,6 +835,66 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn pacing_cwnd_cap_still_limits_large_windows_and_can_be_raised() {
+        let mut bbr =
+            BBRv2::new(10, 10_000, 1200, Duration::from_millis(20), None);
+        bbr.cwnd = 48_000;
+        bbr.limit_cwnd(24_000);
+        bbr.update_congestion_window(1200);
+        assert_eq!(bbr.get_congestion_window(), 24_000);
+
+        // A new, larger cap replaces the old one rather than permanently
+        // narrowing the allowed window. Normal ACK-driven growth still works.
+        bbr.cwnd = 18_000;
+        bbr.limit_cwnd(48_000);
+        bbr.update_congestion_window(12_000);
+        assert_eq!(bbr.get_congestion_window(), 30_000);
+    }
+
+    #[rstest]
+    fn pacing_cwnd_cap_preserves_minimum_after_feedback_and_mss_update(
+        #[values(1, 4, 10, 128)] min_cwnd_packets: usize,
+        #[values(0, 342, 24_000)] pacing_cwnd_bytes: usize,
+    ) {
+        let params = BbrParams {
+            min_cwnd_packets: Some(min_cwnd_packets),
+            ..Default::default()
+        };
+        let mut bbr = BBRv2::new(
+            10,
+            10_000,
+            1200,
+            Duration::from_micros(200),
+            Some(&params),
+        );
+
+        bbr.limit_cwnd(pacing_cwnd_bytes);
+        // Exercise the same window update used after ACK/loss feedback, not
+        // just the bound's stored value. A legal packet must still fit.
+        bbr.update_congestion_window(1200);
+        assert!(bbr.get_congestion_window() >= min_cwnd_packets * 1200);
+        assert!(
+            bbr.get_congestion_window() <=
+                pacing_cwnd_bytes.max(min_cwnd_packets * 1200)
+        );
+
+        for mss in [1450, 1200] {
+            bbr.update_mss(mss);
+            bbr.update_congestion_window(mss);
+            assert!(bbr.get_congestion_window() >= min_cwnd_packets * mss);
+            // Refreshing the pacing cap after a new RTT sample must also
+            // retain the current, rather than the original, packet geometry.
+            bbr.limit_cwnd(pacing_cwnd_bytes);
+            bbr.update_congestion_window(mss);
+            assert!(bbr.get_congestion_window() >= min_cwnd_packets * mss);
+            assert!(
+                bbr.get_congestion_window() <=
+                    pacing_cwnd_bytes.max(min_cwnd_packets * mss)
+            );
+        }
+    }
 
     #[rstest]
     fn update_mss(#[values(false, true)] scale_pacing_rate_by_mss: bool) {
