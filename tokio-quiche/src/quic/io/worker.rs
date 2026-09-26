@@ -637,6 +637,10 @@ where
                 notify_path_events(ctx.connection_hook.as_deref(), qconn);
                 self.refresh_connection_ids(qconn).await;
 
+                if self.write_state.next_release_time.is_some() {
+                    self.refresh_gcongestion_release_time(qconn, now);
+                }
+
                 let can_release = match self.write_state.next_release_time {
                     None => true,
                     Some(next_release) =>
@@ -781,6 +785,31 @@ where
         }
     }
 
+    /// Refreshes a cached wait from the active gcongestion path's current
+    /// pacer.
+    fn refresh_gcongestion_release_time(
+        &mut self, qconn: &QuicheConnection, now: Instant,
+    ) {
+        // Reads and application callbacks can change the active path or pacing
+        // decision. Preserve the separate legacy pacer's retry semantics.
+        if !qconn.gcongestion_enabled().unwrap_or(false) {
+            return;
+        }
+
+        self.write_state.next_release_time = qconn
+            .get_next_release_time()
+            .filter(|_| self.pacing_enabled(qconn))
+            .and_then(|release| release.time(now))
+            .and_then(|release| {
+                let horizon = qconn.max_release_into_future();
+                if release.duration_since(now) >= horizon {
+                    Some(release - horizon)
+                } else {
+                    None
+                }
+            });
+    }
+
     /// Gathers one or more packets from quiche into `send_buf`.
     ///
     /// A single-packet gather leaves a full buffer available for the next
@@ -821,8 +850,11 @@ where
                 let max_into_fut = qconn.max_release_into_future();
 
                 if future_release_time.duration_since(now) >= max_into_fut {
+                    // Wake when the packet enters the release horizon. A
+                    // fixed retry interval can oversleep that boundary and
+                    // repeatedly leave a rate-limited sender underutilized.
                     self.write_state.next_release_time =
-                        Some(now + max_into_fut.mul_f32(0.8));
+                        Some(future_release_time - max_into_fut);
                     self.write_state.has_pending_data = false;
                     return Ok(0);
                 }
@@ -1710,6 +1742,199 @@ mod tests {
 
     fn source_ids(connection: &QuicheConnection) -> Vec<Vec<u8>> {
         connection.source_ids().map(|cid| cid.to_vec()).collect()
+    }
+
+    fn pacing_test_pipe() -> Pipe<crate::buf_factory::BufFactory> {
+        let mut client_config = test_config(false);
+        let mut server_config = test_config(true);
+        for config in [&mut client_config, &mut server_config] {
+            config.set_cc_algorithm_name("bbr2_gcongestion").unwrap();
+            config.set_initial_congestion_window_packets(128);
+            config.set_initial_rtt(Duration::from_micros(200));
+            config.set_max_send_udp_payload_size(1350);
+            config.set_max_recv_udp_payload_size(1350);
+            config.enable_pacing(true);
+            config.enable_dgram(true, 64, 64);
+        }
+        let mut pipe =
+            Pipe::<crate::buf_factory::BufFactory>::with_client_and_server_config_and_buf(
+                &mut client_config,
+                &mut server_config,
+            )
+            .unwrap();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        pipe
+    }
+
+    fn prime_future_release(
+        pipe: &mut Pipe<crate::buf_factory::BufFactory>,
+    ) -> Instant {
+        pipe.server.set_max_pacing_rate(1);
+        for _ in 0..64 {
+            pipe.server.dgram_send(&[0x67; 1206]).unwrap();
+        }
+
+        // Deliberately generate ahead of release times without transmitting or
+        // ACKing. This only prepares a real future pacer decision for gather;
+        // it is not a test of achievable throughput or pacing enforcement.
+        let mut packet = [0; 1350];
+        (0..48)
+            .find_map(|_| {
+                pipe.server.send(&mut packet).unwrap();
+                let now = Instant::now();
+                pipe.server
+                    .get_next_release_time()
+                    .unwrap()
+                    .time(now)
+                    .filter(|release| {
+                        release.duration_since(now) >= Duration::from_millis(100)
+                    })
+            })
+            .expect("prepare a future release while retaining queued data")
+    }
+
+    #[test]
+    fn gather_retries_at_fixed_release_horizon() {
+        let mut pipe = pacing_test_pipe();
+        let release = prime_future_release(&mut pipe);
+        let mut packet = [0; 1350];
+        let horizon = pipe.server.max_release_into_future();
+        let deadline = release - horizon;
+        let queued = pipe.server.dgram_send_queue_len();
+        let sent = pipe.server.stats().sent;
+        let dgram_sent = pipe.server.stats().dgram_sent;
+        assert!(queued > 0);
+
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0x6a; 20]);
+        let (mut worker, _commands) = cid_test_worker(current_cid, generated);
+        worker.cfg.local_addr = Pipe::server_addr();
+        worker.cfg.peer_addr = Pipe::client_addr();
+        worker.cfg.pacing_offload = true;
+        for _ in 0..3 {
+            assert!(Instant::now() < deadline, "future-release setup expired");
+            worker.write_state.has_pending_data = true;
+            assert_eq!(
+                worker
+                    .gather_data_from_quiche_conn(
+                        &mut pipe.server,
+                        &mut packet,
+                        true,
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(worker.write_state.next_release_time, Some(deadline));
+            assert!(!worker.write_state.has_pending_data);
+            assert_eq!(worker.write_state.bytes_written, 0);
+            assert_eq!(worker.write_state.num_pkts, 0);
+            assert_eq!(pipe.server.stats().sent, sent);
+            assert_eq!(pipe.server.dgram_send_queue_len(), queued);
+            worker.refresh_gcongestion_release_time(&pipe.server, Instant::now());
+            assert_eq!(worker.write_state.next_release_time, Some(deadline));
+        }
+
+        // The same queued data remains sendable when offload scheduling is off.
+        worker.cfg.pacing_offload = false;
+        worker.refresh_gcongestion_release_time(&pipe.server, Instant::now());
+        assert_eq!(worker.write_state.next_release_time, None);
+        assert!(
+            worker
+                .gather_data_from_quiche_conn(
+                    &mut pipe.server,
+                    &mut packet,
+                    true,
+                )
+                .unwrap() >
+                0
+        );
+        assert_eq!(worker.write_state.num_pkts, 1);
+        assert_eq!(worker.write_state.tx_time, None);
+        assert_eq!(pipe.server.stats().sent, sent + 1);
+        assert_eq!(pipe.server.stats().dgram_sent, dgram_sent + 1);
+        assert_eq!(pipe.server.dgram_send_queue_len(), queued - 1);
+    }
+
+    #[test]
+    fn peer_migration_refreshes_cached_release_horizon() {
+        let mut pipe = pacing_test_pipe();
+        let release = prime_future_release(&mut pipe);
+        let old_deadline = release - pipe.server.max_release_into_future();
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0x6b; 20]);
+        let (mut worker, _commands) = cid_test_worker(current_cid, generated);
+        worker.cfg.local_addr = Pipe::server_addr();
+        worker.cfg.peer_addr = Pipe::client_addr();
+        worker.cfg.pacing_offload = true;
+        let mut packet = [0; 1350];
+        assert_eq!(
+            worker
+                .gather_data_from_quiche_conn(&mut pipe.server, &mut packet, true)
+                .unwrap(),
+            0
+        );
+        assert_eq!(worker.write_state.next_release_time, Some(old_deadline));
+
+        // A genuine encrypted application packet from a new peer switches the
+        // active path. Its fresh pacer must not inherit the old path's wait.
+        pipe.client.dgram_send(&[0x42; 1206]).unwrap();
+        let flight = emit_flight(&mut pipe.client).unwrap();
+        let new_peer = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            Pipe::client_addr().port(),
+        );
+        for (packet, send_info) in flight {
+            assert!(worker
+                .process_incoming(
+                    &mut pipe.server,
+                    incoming(new_peer, send_info.to, packet, None),
+                )
+                .unwrap());
+        }
+        let active = pipe.server.path_stats().find(|path| path.active).unwrap();
+        assert_eq!(active.peer_addr, new_peer);
+        assert_eq!(pipe.server.dgram_recv(&mut packet), Ok(1206));
+        assert_eq!(&packet[..1206], &[0x42; 1206]);
+        let now = Instant::now();
+        assert!(old_deadline.duration_since(now) > RELEASE_TIMER_THRESHOLD);
+        assert_eq!(pipe.server.get_next_release_time().unwrap().time(now), None);
+
+        // Match the work loop's post-read refresh before testing its cached
+        // deadline. The active path is ready even while the old timer is not.
+        worker.refresh_gcongestion_release_time(&pipe.server, now);
+        assert_eq!(worker.write_state.next_release_time, None);
+        let mut replied_on_new_path = false;
+        for _ in 0..=pipe.server.stats().paths_count {
+            let written = worker
+                .gather_data_from_quiche_conn(&mut pipe.server, &mut packet, true)
+                .unwrap();
+            if written > 0 &&
+                worker.write_state.selected_path ==
+                    Some((Pipe::server_addr(), new_peer))
+            {
+                replied_on_new_path = true;
+                break;
+            }
+        }
+        assert!(replied_on_new_path, "new path must produce a response");
+    }
+
+    #[cfg(not(feature = "gcongestion"))]
+    #[test]
+    fn legacy_pacer_keeps_cached_release_horizon() {
+        let mut pipe = test_pipe();
+        pipe.handshake().unwrap();
+        pipe.advance().unwrap();
+        assert_eq!(pipe.server.gcongestion_enabled(), Some(false));
+        let current_cid = pipe.server.source_id().into_owned();
+        let generated = ConnectionId::from_vec(vec![0x6c; 20]);
+        let (mut worker, _commands) = cid_test_worker(current_cid, generated);
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(5);
+        worker.write_state.next_release_time = Some(deadline);
+        worker.refresh_gcongestion_release_time(&pipe.server, now);
+        assert_eq!(worker.write_state.next_release_time, Some(deadline));
     }
 
     #[tokio::test]
