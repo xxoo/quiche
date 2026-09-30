@@ -7051,6 +7051,32 @@ impl<F: BufFactory> Connection<F> {
         self.dgram_send_queue.purge(f);
     }
 
+    /// Purges outgoing DATAGRAMs in successful enqueue order, oldest first.
+    ///
+    /// [`DgramPurgeDecision::Keep`] retains only the current item and
+    /// continues. [`DgramPurgeDecision::Stop`] retains the current item and
+    /// all remaining items without calling `f` again. Retained items keep
+    /// their relative order. The byte and item counters remain accurate if
+    /// `f` panics; completed removals are preserved and the current item
+    /// and suffix remain queued.
+    ///
+    /// Dropping a prefix of K items followed by Stop takes O(K + 1) queue work
+    /// and callback invocations (O(K) when the queue is exhausted), independent
+    /// of the retained suffix length. A Drop after a Keep additionally moves
+    /// up to min(retained prefix length, remaining suffix length) queue
+    /// entries. For arbitrary full-queue filtering,
+    /// [`Self::dgram_purge_outgoing`] avoids these repeated shifts. The
+    /// caller must prove its own predicate permits early stopping; a Keep
+    /// never implicitly stops traversal.
+    #[inline]
+    pub fn dgram_purge_outgoing_ordered<
+        FN: FnMut(&[u8]) -> DgramPurgeDecision,
+    >(
+        &mut self, f: FN,
+    ) {
+        self.dgram_send_queue.purge_ordered(f);
+    }
+
     /// Returns the maximum DATAGRAM payload that can be sent.
     ///
     /// [`None`] is returned if the peer hasn't advertised a maximum DATAGRAM
@@ -9700,6 +9726,8 @@ pub mod test_utils;
 
 #[cfg(test)]
 mod tests;
+
+pub use crate::dgram::DgramPurgeDecision;
 
 pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;

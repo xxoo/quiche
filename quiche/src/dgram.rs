@@ -30,6 +30,17 @@ use crate::Result;
 
 use std::collections::VecDeque;
 
+/// Action for one queued outgoing DATAGRAM during ordered purge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DgramPurgeDecision {
+    /// Retain this DATAGRAM and continue visiting the queue.
+    Keep,
+    /// Remove this DATAGRAM and continue visiting the queue.
+    Drop,
+    /// Retain this DATAGRAM and the entire unvisited suffix.
+    Stop,
+}
+
 /// Keeps track of DATAGRAM frames.
 #[derive(Default)]
 pub struct DatagramQueue<F: BufFactory> {
@@ -93,15 +104,56 @@ impl<F: BufFactory> DatagramQueue<F> {
     }
 
     pub fn purge<FN: Fn(&[u8]) -> bool>(&mut self, f: FN) {
-        let mut queue_bytes_size = 0;
-        self.queue.retain(|d| {
+        // VecDeque::retain can unwind before truncating removed entries.
+        // Recount only on unwind; successful filtering still scans just once.
+        struct LedgerGuard<'a, T: AsRef<[u8]>> {
+            queue: &'a mut VecDeque<T>,
+            bytes: &'a mut usize,
+            committed: bool,
+        }
+        impl<T: AsRef<[u8]>> Drop for LedgerGuard<'_, T> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    *self.bytes =
+                        self.queue.iter().map(|d| d.as_ref().len()).sum();
+                }
+            }
+        }
+        let mut guard = LedgerGuard {
+            queue: &mut self.queue,
+            bytes: &mut self.queue_bytes_size,
+            committed: false,
+        };
+        let mut bytes = 0;
+        guard.queue.retain(|d| {
             let keep = !f(d.as_ref());
             if keep {
-                queue_bytes_size += d.as_ref().len();
+                bytes += d.as_ref().len();
             }
             keep
         });
-        self.queue_bytes_size = queue_bytes_size;
+        *guard.bytes = bytes;
+        guard.committed = true;
+    }
+
+    pub fn purge_ordered<FN: FnMut(&[u8]) -> DgramPurgeDecision>(
+        &mut self, mut f: FN,
+    ) {
+        let mut index = 0;
+        while let Some(d) = self.queue.get(index) {
+            let len = d.as_ref().len();
+            match f(d.as_ref()) {
+                DgramPurgeDecision::Keep => index += 1,
+                DgramPurgeDecision::Drop => {
+                    // At index zero VecDeque::remove is pop_front: an expired
+                    // prefix does not visit or move any item in the suffix.
+                    let removed = self.queue.remove(index).unwrap();
+                    self.queue_bytes_size -= len;
+                    drop(removed);
+                },
+                DgramPurgeDecision::Stop => break,
+            }
+        }
     }
 
     pub fn is_full(&self) -> bool {
@@ -118,5 +170,136 @@ impl<F: BufFactory> DatagramQueue<F> {
 
     pub fn byte_size(&self) -> usize {
         self.queue_bytes_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffers::DefaultBufFactory;
+    use std::panic::catch_unwind;
+    use std::panic::AssertUnwindSafe;
+
+    fn queue(n: usize, wrapped: bool) -> DatagramQueue<DefaultBufFactory> {
+        let mut q = DatagramQueue::new(n.max(1));
+        if wrapped {
+            q.queue.reserve(n);
+            for _ in 0..(n / 2).max(1) {
+                q.push(vec![0]).unwrap();
+                q.pop();
+            }
+        }
+        for i in 0..n {
+            q.push(vec![i as u8; i % 7 + 1]).unwrap();
+        }
+        if wrapped && n >= 7 {
+            assert!(!q.queue.as_slices().1.is_empty());
+        }
+        q
+    }
+
+    fn assert_ledger(q: &DatagramQueue<DefaultBufFactory>, ids: &[u8]) {
+        assert_eq!(q.queue.iter().map(|d| d[0]).collect::<Vec<_>>(), ids);
+        assert_eq!(q.len(), ids.len());
+        assert_eq!(q.byte_size(), q.queue.iter().map(Vec::len).sum());
+    }
+
+    #[test]
+    fn ordered_purge_prefix_visits_only_dropped_items_and_boundary() {
+        for wrapped in [false, true] {
+            for n in [0, 1, 7, 64] {
+                for k in 0..=n {
+                    let mut q = queue(n, wrapped);
+                    let mut visits = Vec::new();
+                    q.purge_ordered(|d| {
+                        visits.push(d[0]);
+                        if usize::from(d[0]) < k {
+                            DgramPurgeDecision::Drop
+                        } else {
+                            DgramPurgeDecision::Stop
+                        }
+                    });
+                    assert_eq!(
+                        visits,
+                        (0..n.min(k + 1) as u8).collect::<Vec<_>>()
+                    );
+                    assert_ledger(&q, &(k as u8..n as u8).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_purge_mixed_matches_full_predicate_until_explicit_stop() {
+        for wrapped in [false, true] {
+            for mask in 0..256u16 {
+                for stop in 0..=8 {
+                    let mut q = queue(8, wrapped);
+                    let mut expected = queue(8, wrapped);
+                    let mut visited = 0;
+                    q.purge_ordered(|d| {
+                        assert_eq!(usize::from(d[0]), visited);
+                        visited += 1;
+                        if usize::from(d[0]) == stop {
+                            DgramPurgeDecision::Stop
+                        } else if mask & (1 << d[0]) != 0 {
+                            DgramPurgeDecision::Drop
+                        } else {
+                            DgramPurgeDecision::Keep
+                        }
+                    });
+                    expected.purge(|d| {
+                        usize::from(d[0]) < stop && mask & (1 << d[0]) != 0
+                    });
+                    assert_eq!(visited, 8.min(stop + 1));
+                    assert_eq!(q.queue, expected.queue);
+                    assert_eq!(q.byte_size(), expected.byte_size());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn purge_panic_preserves_partial_progress_and_byte_ledger() {
+        for ordered in [false, true] {
+            for wrapped in [false, true] {
+                for panic_at in 0..8 {
+                    let mut q = queue(8, wrapped);
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        let predicate = |d: &[u8]| {
+                            assert_ne!(d[0], panic_at, "classifier panic");
+                            d[0] % 2 == 0
+                        };
+                        if ordered {
+                            q.purge_ordered(|d| {
+                                if predicate(d) {
+                                    DgramPurgeDecision::Drop
+                                } else {
+                                    DgramPurgeDecision::Keep
+                                }
+                            });
+                        } else {
+                            q.purge(predicate);
+                        }
+                    }));
+                    assert!(result.is_err());
+                    let ids = (0..8)
+                        .filter(|i| *i >= panic_at || i % 2 != 0)
+                        .collect::<Vec<_>>();
+                    if ordered {
+                        assert_ledger(&q, &ids);
+                    } else {
+                        assert_eq!(
+                            q.byte_size(),
+                            q.queue.iter().map(Vec::len).sum()
+                        );
+                    }
+                    while q.pop().is_some() {}
+                    assert_eq!(q.byte_size(), 0);
+                    q.push(vec![42; 11]).unwrap();
+                    assert_eq!(q.byte_size(), 11);
+                }
+            }
+        }
     }
 }
