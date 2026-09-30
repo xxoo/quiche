@@ -500,7 +500,9 @@ impl TransportParams {
             b.put_varint(tp.initial_max_streams_uni)?;
         }
 
-        if tp.ack_delay_exponent != 0 {
+        // Omitting these parameters selects their non-zero RFC 9000 defaults;
+        // an explicitly configured zero must be sent on the wire.
+        if tp.ack_delay_exponent != 3 {
             assert!(tp.ack_delay_exponent <= MAX_ACK_DELAY_EXPONENT);
             TransportParams::encode_param(
                 &mut b,
@@ -510,7 +512,7 @@ impl TransportParams {
             b.put_varint(tp.ack_delay_exponent)?;
         }
 
-        if tp.max_ack_delay != 0 {
+        if tp.max_ack_delay != 25 {
             assert!(tp.max_ack_delay <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,

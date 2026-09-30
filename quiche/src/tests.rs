@@ -119,6 +119,191 @@ fn transport_params() {
     assert_eq!(new_tp, tp);
 }
 
+#[rstest]
+fn ack_transport_params_round_trip(
+    #[values(0, 1, 3, 20)] ack_delay_exponent: u64,
+    #[values(0, 1, 25, 16383)] max_ack_delay: u64,
+    #[values(false, true)] is_server: bool,
+) {
+    let params = TransportParams {
+        ack_delay_exponent,
+        max_ack_delay,
+        ..TransportParams::default()
+    };
+    let mut buf = [0; 128];
+    let encoded = TransportParams::encode(&params, is_server, &mut buf).unwrap();
+    let decoded = TransportParams::decode(encoded, !is_server, None).unwrap();
+    assert_eq!(decoded, params);
+}
+
+#[test]
+fn ack_transport_params_omit_only_defaults() {
+    for (exponent, delay) in [(3, 25), (0, 0), (1, 1), (20, 16383)] {
+        let params = TransportParams {
+            ack_delay_exponent: exponent,
+            max_ack_delay: delay,
+            ..TransportParams::default()
+        };
+        let mut buf = [0; 128];
+        let encoded = TransportParams::encode(&params, false, &mut buf).unwrap();
+        let mut input = octets::Octets::with_slice(encoded);
+        let mut ack_exponent_present = false;
+        let mut ack_delay_present = false;
+        while input.cap() > 0 {
+            let id = input.get_varint().unwrap();
+            let len = input.get_varint().unwrap() as usize;
+            let mut value = input.get_bytes(len).unwrap();
+            match id {
+                0x000a => {
+                    ack_exponent_present = true;
+                    assert_eq!(value.get_varint().unwrap(), exponent);
+                },
+                0x000b => {
+                    ack_delay_present = true;
+                    assert_eq!(value.get_varint().unwrap(), delay);
+                },
+                _ => (),
+            }
+        }
+        assert_eq!(ack_exponent_present, exponent != 3);
+        assert_eq!(ack_delay_present, delay != 25);
+    }
+    let omitted = TransportParams::decode(&[], false, None).unwrap();
+    assert_eq!(omitted.ack_delay_exponent, 3);
+    assert_eq!(omitted.max_ack_delay, 25);
+}
+
+#[rstest]
+fn ack_transport_params_handshake(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values((0, 0), (3, 25), (1, 1), (20, 16383))] values: (u64, u64),
+) {
+    let mut client = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    client.set_ack_delay_exponent(values.0);
+    client.set_max_ack_delay(values.1);
+    let mut server = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    // Keep the opposite endpoint different to catch use of local parameters.
+    server.set_ack_delay_exponent(2);
+    server.set_max_ack_delay(7);
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    pipe.handshake().unwrap();
+    pipe.advance().unwrap();
+    for (conn, expected) in [(&pipe.server, values), (&pipe.client, (2, 7))] {
+        let params = conn.peer_transport_params().unwrap();
+        assert_eq!(params.ack_delay_exponent, expected.0);
+        assert_eq!(params.max_ack_delay, expected.1);
+        assert_eq!(
+            conn.recovery_config.max_ack_delay,
+            Duration::from_millis(expected.1)
+        );
+    }
+}
+
+#[rstest]
+#[case(0, 25, 10_875, 57_875)]
+#[case(3, 25, 10_000, 50_000)]
+#[case(0, 0, 11_000, 34_000)]
+#[case(3, 0, 11_000, 34_000)]
+#[case(3, 1, 10_875, 33_875)]
+fn ack_transport_params_recovery(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[case] exponent: u64, #[case] max_ack_delay: u64,
+    #[case] expected_rtt_us: u64, #[case] expected_pto_us: u64,
+) {
+    let mut config = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    config.set_ack_delay_exponent(exponent);
+    config.set_max_ack_delay(max_ack_delay);
+    config.enable_pacing(false);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+    pipe.advance().unwrap();
+    assert!(pipe.client.handshake_status().completed);
+
+    // Use the parameters obtained through TLS, with fresh deterministic
+    // recovery samples so host scheduling and handshake RTT cannot mask the
+    // effect.
+    let conn = &mut pipe.client;
+    conn.paths.get_active_mut().unwrap().recovery =
+        recovery::Recovery::new_with_config(&conn.recovery_config);
+    let epoch = packet::Epoch::Application;
+    let now = Instant::now();
+    let hdr = Header {
+        ty: Type::Short,
+        version: PROTOCOL_VERSION,
+        dcid: ConnectionId::from_ref(&[]),
+        scid: ConnectionId::from_ref(&[]),
+        pkt_num: 0,
+        pkt_num_len: 1,
+        token: None,
+        versions: None,
+        key_phase: false,
+    };
+    for (pkt_num, sample_ms) in [(100, 10), (101, 18), (102, 18)] {
+        let sent_at = now + Duration::from_millis((pkt_num - 100) * 100);
+        let status = conn.handshake_status();
+        conn.paths
+            .get_active_mut()
+            .unwrap()
+            .recovery
+            .on_packet_sent(
+                recovery::Sent {
+                    pkt_num,
+                    frames: Default::default(),
+                    time_sent: sent_at,
+                    time_acked: None,
+                    time_lost: None,
+                    size: 1200,
+                    ack_eliciting: true,
+                    in_flight: true,
+                    delivered: 0,
+                    delivered_time: sent_at,
+                    first_sent_time: sent_at,
+                    is_app_limited: false,
+                    tx_in_flight: 0,
+                    lost: 0,
+                    has_data: true,
+                    is_pmtud_probe: false,
+                },
+                epoch,
+                status,
+                sent_at,
+                "ack-transport-params-test",
+            );
+        conn.pkt_num_spaces[epoch].largest_tx_pkt_num = Some(pkt_num);
+        if pkt_num == 102 {
+            let recovery = &conn.paths.get_active().unwrap().recovery;
+            assert_eq!(
+                recovery.loss_detection_timer().unwrap() - sent_at,
+                recovery.pto() + Duration::from_millis(max_ack_delay)
+            );
+            assert_eq!(
+                recovery.loss_detection_timer().unwrap() - sent_at,
+                Duration::from_micros(expected_pto_us)
+            );
+            break;
+        }
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(pkt_num..pkt_num + 1);
+        conn.process_frame(
+            frame::Frame::ACK {
+                ack_delay: 1000,
+                ranges,
+                ecn_counts: None,
+            },
+            &hdr,
+            0,
+            epoch,
+            sent_at + Duration::from_millis(sample_ms),
+        )
+        .unwrap();
+    }
+    let recovery = &conn.paths.get_active().unwrap().recovery;
+    assert_eq!(recovery.min_rtt(), Some(Duration::from_millis(10)));
+    assert_eq!(recovery.rtt(), Duration::from_micros(expected_rtt_us));
+}
+
 #[test]
 fn transport_params_forbid_duplicates() {
     // Given an encoded param.
@@ -6947,7 +7132,7 @@ fn client_rst_stream_while_bytes_in_flight(
         if cc_algorithm_name == "cubic" {
             Ok(12000)
         } else {
-            Ok(by_boring!(b4: 13878, b5: 15030))
+            Ok(by_boring!(b4: 13872, b5: 15024))
         }
     );
     let server_flight = test_utils::emit_flight(&mut pipe.server).unwrap();
@@ -6968,7 +7153,7 @@ fn client_rst_stream_while_bytes_in_flight(
     // tx_buffered goes down to 0 after the reset and acks are
     // processed.  A full cwnd's worth of packets can be sent.
     let expected_cwnd = match cc_algorithm_name {
-        "bbr2" | "bbr2_gcongestion" => by_boring!(b4: 27756, b5: 30060),
+        "bbr2" | "bbr2_gcongestion" => by_boring!(b4: 27744, b5: 30048),
         _ => 24000,
     };
 
@@ -7036,7 +7221,7 @@ fn client_rst_stream_while_bytes_in_flight_with_packet_loss(
         if cc_algorithm_name == "cubic" {
             Ok(12000)
         } else {
-            Ok(by_boring!(b4: 13878, b5: 15030))
+            Ok(by_boring!(b4: 13872, b5: 15024))
         }
     );
     let mut server_flight = test_utils::emit_flight(&mut pipe.server).unwrap();
@@ -7056,7 +7241,7 @@ fn client_rst_stream_while_bytes_in_flight_with_packet_loss(
     // tx_buffered goes down to 0 after the reset and acks are
     // processed.  A full cwnd's worth of packets can be sent.
     let expected_cwnd = match cc_algorithm_name {
-        "bbr2" | "bbr2_gcongestion" => by_boring!(b4: 26556, b5: 28860),
+        "bbr2" | "bbr2_gcongestion" => by_boring!(b4: 26544, b5: 28848),
         _ => 8400,
     };
 
@@ -7117,7 +7302,7 @@ fn sends_ack_only_pkt_when_full_cwnd_and_ack_elicited(
         if cc_algorithm_name == "cubic" {
             Ok(12000)
         } else {
-            Ok(by_boring!(b4: 12299, b5: 13587))
+            Ok(by_boring!(b4: 12293, b5: 13581))
         }
     );
 
@@ -7192,7 +7377,7 @@ fn sends_ack_only_pkt_when_full_cwnd_and_ack_elicited_despite_max_unacknowledgin
         if cc_algorithm_name == "cubic" {
             Ok(12000)
         } else {
-            Ok(by_boring!(b4: 12299, b5: 13587))
+            Ok(by_boring!(b4: 12293, b5: 13581))
         }
     );
 
@@ -9707,7 +9892,7 @@ fn update_max_datagram_size(
         if cc_algorithm_name == "cubic" {
             12000
         } else {
-            by_boring!(b4: 13421, b5: 14573)
+            by_boring!(b4: 13415, b5: 14567)
         },
     );
 }
@@ -9782,7 +9967,7 @@ fn send_capacity(
         if cc_algorithm_name == "cubic" {
             12000
         } else {
-            by_boring!(b4: 13873, b5: 15025)
+            by_boring!(b4: 13867, b5: 15019)
         }
     );
 
@@ -9797,7 +9982,7 @@ fn send_capacity(
         if cc_algorithm_name == "cubic" {
             Ok(2000)
         } else {
-            Ok(by_boring!(b4: 3873, b5: 5025))
+            Ok(by_boring!(b4: 3867, b5: 5019))
         }
     );
 
@@ -10254,7 +10439,7 @@ fn initial_cwnd(
         // `initial_cwnd`) is larger under boring 5 because the
         // ClientHello carries a post-quantum key share by default.
         let expected = CUSTOM_INITIAL_CONGESTION_WINDOW_PACKETS * 1200 +
-            by_boring!(b4: 1447, b5: 2598);
+            by_boring!(b4: 1444, b5: 2595);
         const TOLERANCE: usize = 4;
 
         assert!(
@@ -12105,7 +12290,7 @@ fn resilience_against_migration_attack(
     let mut recv_buf = [0; DATA_BYTES];
     let send1_bytes = pipe.server.stream_send(1, &buf, true).unwrap();
     assert_eq!(send1_bytes, match cc_algorithm_name {
-        "bbr2" | "bbr2_gcongestion" => by_boring!(b4: 13880, b5: 15032),
+        "bbr2" | "bbr2_gcongestion" => by_boring!(b4: 13874, b5: 15026),
         _ => 12000,
     });
     assert_eq!(
