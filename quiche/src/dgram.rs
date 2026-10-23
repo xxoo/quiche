@@ -201,7 +201,7 @@ mod tests {
     fn assert_ledger(q: &DatagramQueue<DefaultBufFactory>, ids: &[u8]) {
         assert_eq!(q.queue.iter().map(|d| d[0]).collect::<Vec<_>>(), ids);
         assert_eq!(q.len(), ids.len());
-        assert_eq!(q.byte_size(), q.queue.iter().map(Vec::len).sum());
+        assert_eq!(q.byte_size(), q.queue.iter().map(Vec::len).sum::<usize>());
     }
 
     #[test]
@@ -268,7 +268,7 @@ mod tests {
                     let result = catch_unwind(AssertUnwindSafe(|| {
                         let predicate = |d: &[u8]| {
                             assert_ne!(d[0], panic_at, "classifier panic");
-                            d[0] % 2 == 0
+                            d[0].is_multiple_of(2)
                         };
                         if ordered {
                             q.purge_ordered(|d| {
@@ -291,7 +291,7 @@ mod tests {
                     } else {
                         assert_eq!(
                             q.byte_size(),
-                            q.queue.iter().map(Vec::len).sum()
+                            q.queue.iter().map(Vec::len).sum::<usize>()
                         );
                     }
                     while q.pop().is_some() {}
