@@ -182,6 +182,7 @@ where
     /// should be 0 outside of `poll_conn_map_commands`.
     conn_map_cmd_buf: Vec<ConnectionMapCommand>,
     accept_sink: mpsc::Sender<io::Result<InitialQuicConnection<Tx, M>>>,
+    accept_sink_closed: Pin<Box<dyn Future<Output = ()> + Send>>,
     metrics: M,
     #[cfg(target_os = "linux")]
     udp_drop_count: u32,
@@ -213,6 +214,10 @@ where
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
         let (conn_map_cmd_tx, conn_map_cmd_rx) = mpsc::unbounded_channel();
+        let accept_sink_closed = {
+            let sender = accept_sink.clone();
+            Box::pin(async move { sender.closed().await })
+        };
 
         (
             InboundPacketRouter {
@@ -232,6 +237,7 @@ where
                 conn_map_cmd_rx,
                 conn_map_cmd_buf: Vec::with_capacity(4),
                 accept_sink,
+                accept_sink_closed,
                 #[cfg(target_os = "linux")]
                 udp_drop_count: 0,
                 #[cfg(target_os = "linux")]
@@ -916,7 +922,11 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         loop {
             // First, check whether the app stopped accepting connections.
-            if self.shutdown_tx.is_some() && self.accept_sink.is_closed() {
+            // Keep this future alive between polls so receiver closure wakes
+            // an idle router, even when no packets or QUIC timers remain.
+            if self.shutdown_tx.is_some() &&
+                self.accept_sink_closed.as_mut().poll(cx).is_ready()
+            {
                 self.shutdown_tx = None;
             }
 
