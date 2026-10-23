@@ -110,6 +110,7 @@ use tokio::sync::mpsc;
 
 mod addr_validation_token;
 pub(crate) mod connection;
+mod dscp;
 mod hooks;
 mod io;
 pub mod raw;
@@ -134,6 +135,8 @@ pub use self::connection::QuicCommand;
 pub use self::connection::QuicConnectionStats;
 pub use self::connection::ServerInitialMetadata;
 pub use self::connection::SimpleConnectionIdGenerator;
+pub use self::dscp::Dscp;
+pub use self::dscp::DscpHandle;
 pub use self::hooks::ClientInitialInfo;
 pub use self::hooks::ConnectionHook;
 pub use self::hooks::StatelessRetryDecision;
@@ -544,6 +547,7 @@ where
     let acceptor = ConnectionAcceptor::new(
         ConnectionAcceptorConfig {
             connection_hook: params.hooks.connection_hook.clone(),
+            enable_per_connection_dscp: params.enable_per_connection_dscp,
             #[cfg(target_os = "linux")]
             with_pktinfo: if local_addr.is_ipv4() {
                 config.has_ippktinfo

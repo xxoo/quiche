@@ -272,6 +272,9 @@ fn make_quiche_config_with_settings(
     config.set_initial_congestion_window_packets(
         quic_settings.initial_congestion_window_packets,
     );
+    config.set_unchecked_congestion_window(
+        quic_settings.unchecked_congestion_window,
+    );
     config.set_enable_relaxed_loss_threshold(
         quic_settings.enable_relaxed_loss_threshold,
     );
@@ -373,7 +376,9 @@ fn make_keylog_file(
     keylog_path.and_then(|path| {
         if KEYLOGFILE_ENABLED {
             File::options().create(true).append(true).open(path)
-                .inspect_err(|e| log::warn!("failed to open SSLKEYLOGFILE"; "error" => e))
+                .inspect_err(|e| {
+                    log::warn!("failed to open SSLKEYLOGFILE"; "error" => e);
+                })
                 .ok()
         } else {
             log::warn!("SSLKEYLOGFILE is set, but `--cfg capture_keylogs` was not enabled. No keys will be logged.");
@@ -980,5 +985,98 @@ mod tests {
         );
         assert!(!wrongly_trusted.client.is_established());
         assert!(verification_count.load(Ordering::Relaxed) > 0);
+    }
+
+    use quiche::CongestionControlAlgorithm;
+    use quiche::Error;
+
+    use std::net::SocketAddr;
+
+    #[test]
+    fn unchecked_congestion_window_reaches_connections() {
+        let local = SocketAddr::from(([127, 0, 0, 1], 443));
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let connection_id = quiche::ConnectionId::from_ref(&[0xba; 16]);
+
+        for algorithm in [
+            "reno",
+            "cubic",
+            "bbr2_gcongestion",
+            "congestion_window_unchecked",
+        ] {
+            let unsupported_algorithm =
+                algorithm.parse::<CongestionControlAlgorithm>().err();
+            for window in [
+                QuicSettings::default().unchecked_congestion_window,
+                0,
+                7,
+                40 * 1024 * 1024,
+            ] {
+                let settings = QuicSettings {
+                    cc_algorithm: algorithm.to_string(),
+                    unchecked_congestion_window: window,
+                    ..QuicSettings::default()
+                };
+                let expected_window =
+                    if algorithm == "congestion_window_unchecked" {
+                        window
+                    } else {
+                        settings.max_send_udp_payload_size *
+                            settings.initial_congestion_window_packets
+                    };
+                let params = ConnectionParams::new_client(
+                    settings,
+                    None,
+                    Default::default(),
+                );
+                let config = Config::new(&params, SocketCapabilities::default())
+                    .map(|config| config.quiche_config);
+                if let Some(expected_error) = &unsupported_algorithm {
+                    let error = config
+                        .err()
+                        .expect("unsupported controller must be rejected");
+                    assert_eq!(
+                        error.downcast_ref::<Error>(),
+                        Some(expected_error),
+                    );
+                    continue;
+                }
+                let mut config = config.expect("build shared QUIC configuration");
+
+                for (endpoint, connection) in [
+                    (
+                        "client",
+                        quiche::connect(
+                            None,
+                            &connection_id,
+                            local,
+                            peer,
+                            &mut config,
+                        )
+                        .expect("create client connection"),
+                    ),
+                    (
+                        "server",
+                        quiche::accept(
+                            &connection_id,
+                            None,
+                            local,
+                            peer,
+                            &mut config,
+                        )
+                        .expect("create server connection"),
+                    ),
+                ] {
+                    let path = connection
+                        .path_stats()
+                        .next()
+                        .expect("connection has an initial path");
+                    assert_eq!(
+                        path.cwnd, expected_window,
+                        "{endpoint}: {algorithm}, configured window {window}",
+                    );
+                }
+            }
+        }
     }
 }

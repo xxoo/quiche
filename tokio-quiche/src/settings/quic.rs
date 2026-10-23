@@ -182,6 +182,18 @@ pub struct QuicSettings {
     #[serde(default = "QuicSettings::default_initial_congestion_window_packets")]
     pub initial_congestion_window_packets: usize,
 
+    /// Fixed congestion window in bytes for `congestion_window_unchecked`.
+    ///
+    /// Defaults to [`usize::MAX`]. Requires selecting
+    /// `cc_algorithm = "congestion_window_unchecked"` and enabling the
+    /// `congestion_window_unchecked_available` Cargo feature. Ignored for other
+    /// algorithms or when the feature is disabled.
+    ///
+    /// See [`quiche::Config::set_unchecked_congestion_window`] for risks and
+    /// restrictions.
+    #[serde(default = "QuicSettings::default_unchecked_congestion_window")]
+    pub unchecked_congestion_window: usize,
+
     /// Configures whether to enable relaxed loss detection on spurious loss.
     ///
     /// Defaults to `false`.
@@ -239,6 +251,10 @@ pub struct QuicSettings {
     pub capture_quiche_logs: bool,
 
     /// A timeout for the QUIC handshake, in milliseconds.
+    ///
+    /// For connections that accept 0-RTT early data, the application is
+    /// started before the handshake completes, but the timeout still applies
+    /// until the handshake completes.
     ///
     /// Disabled by default.
     #[serde(rename = "handshake_timeout_ms")]
@@ -448,6 +464,11 @@ impl QuicSettings {
     }
 
     #[inline]
+    fn default_unchecked_congestion_window() -> usize {
+        usize::MAX
+    }
+
+    #[inline]
     fn default_enable_hystart() -> bool {
         true
     }
@@ -551,5 +572,43 @@ mod test {
                 include_system_roots: false,
             }))
         );
+    }
+
+    #[test]
+    fn unchecked_congestion_window_defaults_and_round_trips() {
+        let defaults = QuicSettings::default();
+        assert_eq!(defaults.unchecked_congestion_window, usize::MAX);
+
+        for (input, expected_window) in [
+            (serde_json::json!({}), usize::MAX),
+            (serde_json::json!({ "unchecked_congestion_window": 0 }), 0),
+            (
+                serde_json::json!({ "unchecked_congestion_window": 4096 }),
+                4096,
+            ),
+            (
+                serde_json::json!({ "unchecked_congestion_window": usize::MAX }),
+                usize::MAX,
+            ),
+        ] {
+            let settings: QuicSettings =
+                serde_json::from_value(input).expect("deserialize QUIC settings");
+            assert_eq!(settings.unchecked_congestion_window, expected_window);
+
+            let serialized =
+                serde_json::to_value(&settings).expect("serialize QUIC settings");
+            assert_eq!(
+                serialized["unchecked_congestion_window"],
+                serde_json::json!(expected_window),
+            );
+            let restored: QuicSettings = serde_json::from_value(serialized)
+                .expect("round-trip QUIC settings");
+            assert_eq!(restored.unchecked_congestion_window, expected_window);
+            assert_eq!(restored.cc_algorithm, defaults.cc_algorithm);
+            assert_eq!(
+                restored.initial_congestion_window_packets,
+                defaults.initial_congestion_window_packets,
+            );
+        }
     }
 }

@@ -487,6 +487,7 @@ async fn process_h3_events(
     let mut flights = 0;
 
     loop {
+        tokio::task::coop::consume_budget().await;
         assert!(Instant::now() < deadline, "HTTP/3 response timed out");
         match h3_conn.poll(conn) {
             Ok((stream_id, quiche::h3::Event::Headers { .. })) => {
@@ -591,4 +592,104 @@ async fn send_tokio_quiche_request(
             _ => {},
         }
     }
+}
+
+#[test]
+fn process_h3_event_returns_between_response_flights() {
+    let mut config = Pipe::default_config("cubic").unwrap();
+    config.set_application_protos(&[b"h3"]).unwrap();
+    config.set_initial_max_data(1500);
+    config.set_initial_max_stream_data_bidi_local(1500);
+    config.set_initial_max_stream_data_bidi_remote(1500);
+    config.set_initial_max_stream_data_uni(1500);
+
+    let mut pipe = Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut client =
+        quiche::h3::Connection::with_transport(&mut pipe.client, &h3_config)
+            .unwrap();
+    let mut server =
+        quiche::h3::Connection::with_transport(&mut pipe.server, &h3_config)
+            .unwrap();
+
+    let req = [
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/"),
+    ];
+    let stream_id = client.send_request(&mut pipe.client, &req, true).unwrap();
+    pipe.advance().unwrap();
+    assert!(matches!(
+        server.poll(&mut pipe.server),
+        Ok((id, quiche::h3::Event::Headers { .. })) if id == stream_id
+    ));
+
+    // The body is deliberately withheld until the headers-only polls return.
+    server
+        .send_response(
+            &mut pipe.server,
+            stream_id,
+            &[quiche::h3::Header::new(b":status", b"200")],
+            false,
+        )
+        .unwrap();
+    pipe.advance().unwrap();
+    assert!(matches!(
+        process_h3_event(&mut client, &mut pipe.client),
+        Ok(quiche::h3::Event::Headers { .. })
+    ));
+    assert_eq!(
+        process_h3_event(&mut client, &mut pipe.client),
+        Err(quiche::h3::Error::Done)
+    );
+
+    server
+        .send_body(&mut pipe.server, stream_id, b"response", false)
+        .unwrap();
+    pipe.advance().unwrap();
+    assert_eq!(
+        process_h3_event(&mut client, &mut pipe.client),
+        Ok(quiche::h3::Event::Data)
+    );
+    assert_eq!(
+        process_h3_event(&mut client, &mut pipe.client),
+        Err(quiche::h3::Error::Done)
+    );
+
+    // FIN arrives in a third flight, after DATA has been drained.
+    server
+        .send_body(&mut pipe.server, stream_id, b"", true)
+        .unwrap();
+    pipe.advance().unwrap();
+    assert_eq!(
+        process_h3_event(&mut client, &mut pipe.client),
+        Ok(quiche::h3::Event::Data)
+    );
+    assert_eq!(
+        process_h3_event(&mut client, &mut pipe.client),
+        Ok(quiche::h3::Event::Finished)
+    );
+}
+
+fn process_h3_event(
+    h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection,
+) -> quiche::h3::Result<quiche::h3::Event> {
+    let (stream_id, event) = h3_conn.poll(conn)?;
+
+    if matches!(event, quiche::h3::Event::Data) {
+        let mut buf = [0; 65535];
+        // Drain the buffered body so later polling can report response FIN.
+        loop {
+            match h3_conn.recv_body(conn, stream_id, &mut buf) {
+                Ok(_) => {},
+                Err(quiche::h3::Error::Done) => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    Ok(event)
 }

@@ -148,8 +148,8 @@ impl Pmtud {
                 }
             },
 
-            // With only failed probes, binary search between the smallest failed
-            // probe and the minimum supported MTU
+            // With only failed probes, binary search between the smallest
+            // failed probe and the minimum supported MTU
             (Some(failed_probe_size), None) =>
                 self.probe_size = (MIN_PLPMTU + failed_probe_size) / 2,
 

@@ -44,6 +44,7 @@ use crate::metrics::labels;
 use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
 use crate::quic::connection::SharedConnectionIdGenerator;
+use crate::quic::DscpHandle;
 use crate::settings::Config;
 use crate::settings::ServerConnectionConfig;
 use crate::socket::MigratableUdpSocket;
@@ -385,6 +386,7 @@ where
             initial_pkt,
             fixed_peer_ip,
             server_initial_metadata,
+            enable_per_connection_dscp,
         } = new_connection;
 
         let Some(ref shutdown_tx) = self.shutdown_tx else {
@@ -448,6 +450,7 @@ where
         let conn = InitialQuicConnection::new(QuicConnectionParams {
             writer_cfg,
             initial_pkt,
+            dscp_handle: enable_per_connection_dscp.then(DscpHandle::new),
             shutdown_tx: shutdown_tx.clone(),
             conn_map_cmd_tx: self.conn_map_cmd_tx.clone(),
             scid: scid.clone(),
@@ -991,6 +994,7 @@ pub struct NewConnection {
     server_config: Option<ServerConnectionConfig>,
     pending_cid: Option<ConnectionId<'static>>,
     initial_pkt: Option<Incoming>,
+    enable_per_connection_dscp: bool,
     cid_generator: Option<SharedConnectionIdGenerator>,
     /// When the handshake started. Should be called before [`quiche::accept`]
     /// or [`quiche::connect`].
@@ -1011,6 +1015,7 @@ mod tests {
     use crate::metrics::DefaultMetrics;
     use crate::quic::connection::ApplicationOverQuic;
     use crate::quic::connection::SimpleConnectionIdGenerator;
+    use crate::quic::Dscp;
     use crate::quic::QuicheConnection;
     use crate::settings::Config;
     use crate::settings::Hooks;
@@ -1027,6 +1032,7 @@ mod tests {
     use datagram_socket::MAX_DATAGRAM_SIZE;
     use futures::FutureExt as _;
     use h3i::actions::h3::Action;
+    use h3i::actions::h3::WaitType;
     use std::future;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
@@ -1185,11 +1191,8 @@ mod tests {
                             let dgram = self.buf[..len].to_vec();
                             let _ =
                                 dgram_tx.send((qconn.is_in_early_data(), dgram));
-                            let _ = qconn.close(
-                                false,
-                                quiche::WireErrorCode::NoError as u64,
-                                &[],
-                            );
+                            // Let the client finish its handshake after the
+                            // server has observed the early datagram.
                         },
 
                     Err(quiche::Error::Done) => break,
@@ -1237,7 +1240,7 @@ mod tests {
         .await
     }
 
-    fn test_connect(host_port: String) {
+    fn test_connect(host_port: String, wait_before_close: Option<Duration>) {
         let h3i_config = h3i::config::Config::new()
             .with_host_port("test.com".to_string())
             .with_idle_timeout(2000)
@@ -1251,7 +1254,13 @@ mod tests {
             error_code: h3i::quiche::WireErrorCode::NoError as _,
             reason: Vec::new(),
         };
-        let actions = vec![Action::ConnectionClose { error: conn_close }];
+        let mut actions = Vec::new();
+        if let Some(duration) = wait_before_close {
+            actions.push(Action::Wait {
+                wait_type: WaitType::WaitDuration(duration),
+            });
+        }
+        actions.push(Action::ConnectionClose { error: conn_close });
 
         let _ = h3i::client::sync_client::connect(h3i_config, actions, None);
     }
@@ -1313,6 +1322,7 @@ mod tests {
         let socket = Arc::new(NoopDatagramSender);
         let acceptor = ConnectionAcceptor::new(
             ConnectionAcceptorConfig {
+                enable_per_connection_dscp: false,
                 connection_hook: None,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
@@ -1382,6 +1392,7 @@ mod tests {
         let socket_tx = Arc::new(server_socket);
         let acceptor = ConnectionAcceptor::new(
             ConnectionAcceptorConfig {
+                enable_per_connection_dscp: false,
                 connection_hook: None,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
@@ -1454,6 +1465,7 @@ mod tests {
         let socket = Arc::new(NoopDatagramSender);
         let acceptor = ConnectionAcceptor::new(
             ConnectionAcceptorConfig {
+                enable_per_connection_dscp: false,
                 connection_hook: None,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
@@ -1515,11 +1527,12 @@ mod tests {
             kind: crate::settings::CertificateKind::X509,
         };
 
-        let params = ConnectionParams::new_server(
+        let mut params = ConnectionParams::new_server(
             quic_settings,
             tls_cert_settings,
             Hooks::default(),
         );
+        params.enable_per_connection_dscp = true;
         let config = Config::new(&params, SocketCapabilities::default()).unwrap();
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1531,6 +1544,7 @@ mod tests {
         let acceptor = ConnectionAcceptor::new(
             ConnectionAcceptorConfig {
                 connection_hook: params.hooks.connection_hook.clone(),
+                enable_per_connection_dscp: params.enable_per_connection_dscp,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
             },
@@ -1551,7 +1565,7 @@ mod tests {
         tokio::spawn(socket_driver);
 
         // Start a request and drop it after connection establishment
-        std::thread::spawn(move || test_connect(host_port));
+        std::thread::spawn(move || test_connect(host_port, None));
 
         // Wait for a new connection
         time::pause();
@@ -1566,6 +1580,10 @@ mod tests {
         );
         assert!(metadata.handshake_start() <= Instant::now());
         assert!(conn.take_server_initial_metadata().is_none());
+        let dscp_handle = conn.dscp_handle().unwrap().clone();
+        assert_eq!(dscp_handle.get(), None);
+        dscp_handle.set(Dscp::new(0));
+        assert_eq!(conn.dscp_handle().unwrap().get(), Dscp::new(0));
         let drop_check = conn.incoming_ev_sender.clone();
         let _conn = conn.start(h3_driver);
 
@@ -1576,6 +1594,118 @@ mod tests {
         // This is a smoke test. A failure leaves `notified()` unresolved and
         // hangs the test.
         drop_check.closed().await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fuzzing")))]
+    #[tokio::test]
+    async fn test_worker_dscp_across_handshake_ipv4() {
+        check_worker_dscp_across_handshake("127.0.0.1:0").await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fuzzing")))]
+    #[tokio::test]
+    async fn test_worker_dscp_across_handshake_ipv6() {
+        check_worker_dscp_across_handshake("[::1]:0").await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fuzzing")))]
+    async fn check_worker_dscp_across_handshake(bind_addr: &str) {
+        use crate::quic::io::gso::test::enable_tos;
+        use crate::quic::io::gso::test::recv_tos;
+        use futures::StreamExt;
+        use nix::sys::socket::setsockopt;
+        use nix::sys::socket::sockopt;
+
+        let socket = std::net::UdpSocket::bind(bind_addr).unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        if server_addr.is_ipv4() {
+            setsockopt(&socket, sockopt::Ipv4Tos, &0).unwrap();
+        } else {
+            setsockopt(&socket, sockopt::Ipv6TClass, &0).unwrap();
+        }
+
+        let mut settings = QuicSettings::default();
+        settings.disable_client_ip_validation = true;
+        let tls_cert = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let mut params =
+            ConnectionParams::new_server(settings, tls_cert, Hooks::default());
+        params.enable_per_connection_dscp = true;
+        let mut incoming = crate::listen(vec![socket], params, DefaultMetrics)
+            .unwrap()
+            .remove(0);
+
+        let frontend = UdpSocket::bind(bind_addr).await.unwrap();
+        let backend = UdpSocket::bind(bind_addr).await.unwrap();
+        enable_tos(&backend);
+        let host_port = frontend.local_addr().unwrap().to_string();
+        let (marks_tx, mut marks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let relay = tokio::spawn(async move {
+            let mut client_addr = None;
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    received = frontend.recv_from(&mut buf) => {
+                        let (len, addr) = received.unwrap();
+                        client_addr = Some(addr);
+                        backend.send_to(&buf[..len], server_addr).await.unwrap();
+                    }
+                    (packet, tos) = recv_tos(&backend) => {
+                        marks_tx.send(tos >> 2).unwrap();
+                        frontend.send_to(&packet, client_addr.unwrap()).await.unwrap();
+                    }
+                }
+            }
+        });
+        let client = tokio::task::spawn_blocking(move || {
+            test_connect(host_port, Some(Duration::from_secs(1)))
+        });
+
+        let conn = time::timeout(Duration::from_secs(5), incoming.next())
+            .await
+            .expect("no initial packet")
+            .expect("listener closed")
+            .expect("initial packet rejected");
+        let dscp = conn.dscp_handle().unwrap().clone();
+        dscp.set(Dscp::new(34));
+        let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
+        let (_, mut worker) =
+            time::timeout(Duration::from_secs(5), conn.handshake(driver))
+                .await
+                .expect("handshake timed out")
+                .expect("handshake failed");
+
+        // No stateless packets are sent when client IP validation is disabled.
+        assert_eq!(
+            time::timeout(Duration::from_secs(5), marks_rx.recv())
+                .await
+                .expect("no handshake packet"),
+            Some(34)
+        );
+
+        // Force a packet in the running worker to verify the handle survives
+        // handshake() and resume(), not just the initial atomic clone.
+        dscp.set(Dscp::new(28));
+        worker.qconn.send_ack_eliciting().unwrap();
+        InitialQuicConnection::resume(worker);
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                match marks_rx.recv().await.expect("UDP relay closed") {
+                    34 => (), // Handshake packets already in flight.
+                    28 => break,
+                    mark => panic!("unexpected post-handshake DSCP {mark}"),
+                }
+            }
+        })
+        .await
+        .expect("no post-handshake packet with DSCP 28");
+
+        client.await.unwrap();
+        drop(controller);
+        relay.abort();
     }
 
     struct NoopDatagramSender;

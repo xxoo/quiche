@@ -62,6 +62,13 @@ pub struct ConnectionParams<'a> {
     /// [`tls_cert`](Self::tls_cert). Additional profiles inherit those values
     /// unless their profile overrides replace them.
     pub server_config_profiles: Vec<ServerConfigOverrides<'a>>,
+    /// Expose a per-connection DSCP handle for server connections.
+    ///
+    /// The handle initially omits per-packet marking, so packets inherit the
+    /// UDP socket's TOS/TClass until the application selects a value. Only
+    /// Linux UDP sockets support marking; client connections ignore this
+    /// setting.
+    pub enable_per_connection_dscp: bool,
     /// Set the session to attempt resumption.
     pub session: Option<Vec<u8>>,
     /// Raw QUIC DATAGRAM payloads to send as 0-RTT data on client connections.
@@ -106,6 +113,7 @@ impl<'a> Default for ConnectionParams<'a> {
             tls_cert: None,
             hooks: Hooks::default(),
             server_config_profiles: Vec::new(),
+            enable_per_connection_dscp: false,
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
@@ -123,7 +131,11 @@ impl core::fmt::Debug for ConnectionParams<'_> {
         s.field("settings", &self.settings)
             .field("tls_cert", &self.tls_cert)
             .field("hooks", &self.hooks)
-            .field("server_config_profiles", &self.server_config_profiles);
+            .field("server_config_profiles", &self.server_config_profiles)
+            .field(
+                "enable_per_connection_dscp",
+                &self.enable_per_connection_dscp,
+            );
 
         #[cfg(feature = "custom-client-dcid")]
         s.field("dcid", &self.dcid);
@@ -144,6 +156,7 @@ impl<'a> ConnectionParams<'a> {
             tls_cert: Some(tls_cert),
             hooks,
             server_config_profiles: Vec::new(),
+            enable_per_connection_dscp: false,
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
@@ -165,6 +178,7 @@ impl<'a> ConnectionParams<'a> {
             tls_cert,
             hooks,
             server_config_profiles: Vec::new(),
+            enable_per_connection_dscp: false,
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),

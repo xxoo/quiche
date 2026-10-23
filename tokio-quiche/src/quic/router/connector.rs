@@ -259,6 +259,7 @@ where
                 server_config: None,
                 pending_cid: None,
                 initial_pkt: None,
+                enable_per_connection_dscp: false,
                 cid_generator: None,
                 handshake_start_time,
                 fixed_peer_ip: None,
