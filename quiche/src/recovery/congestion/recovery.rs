@@ -893,6 +893,28 @@ impl RecoveryOps for LegacyRecovery {
         self.set_loss_detection_timer(handshake_status, now);
     }
 
+    fn on_retry(&mut self, handshake_status: HandshakeStatus, now: Instant) {
+        let epoch = &mut self.epochs[Epoch::Application];
+        let mut frames = VecDeque::new();
+        while let Some(frame) = epoch.next_lost_frame() {
+            frames.push_back(frame);
+        }
+        frames.extend(
+            epoch
+                .sent_packets
+                .iter()
+                .filter(|p| p.time_acked.is_none() && p.time_lost.is_none())
+                .flat_map(|p| p.frames.iter().cloned()),
+        );
+        frames.retain(|f| !matches!(f, frame::Frame::DatagramHeader { .. }));
+        self.on_pkt_num_space_discarded(
+            Epoch::Application,
+            handshake_status,
+            now,
+        );
+        self.epochs[Epoch::Application].lost_frames_ack = frames.into();
+    }
+
     fn on_path_change(
         &mut self, epoch: Epoch, now: Instant, trace_id: &str,
     ) -> (usize, usize) {

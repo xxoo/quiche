@@ -1038,6 +1038,32 @@ impl RecoveryOps for GRecovery {
         self.set_loss_detection_timer(handshake_status, now);
     }
 
+    fn on_retry(&mut self, handshake_status: HandshakeStatus, now: Instant) {
+        let epoch = &mut self.epochs[packet::Epoch::Application];
+        let mut frames = VecDeque::new();
+        while let Some(frame) = epoch.next_lost_frame() {
+            frames.push_back(frame);
+        }
+        frames.extend(
+            epoch
+                .sent_packets
+                .iter()
+                .filter_map(|p| match &p.status {
+                    SentStatus::Sent { frames, .. } =>
+                        Some(frames.iter().cloned()),
+                    _ => None,
+                })
+                .flatten(),
+        );
+        frames.retain(|f| !matches!(f, frame::Frame::DatagramHeader { .. }));
+        self.on_pkt_num_space_discarded(
+            packet::Epoch::Application,
+            handshake_status,
+            now,
+        );
+        self.epochs[packet::Epoch::Application].lost_frames_ack = frames;
+    }
+
     fn on_path_change(
         &mut self, epoch: packet::Epoch, now: Instant, _trace_id: &str,
     ) -> (usize, usize) {

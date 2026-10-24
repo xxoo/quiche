@@ -6897,6 +6897,144 @@ fn retry_with_pto(
 }
 
 #[rstest]
+fn retry_resends_early_stream_before_finished_without_pto(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(false, true)] lost_before_retry: bool,
+) {
+    fn sent_client_hello(conn: &mut Connection) -> Vec<u8> {
+        let send =
+            &mut conn.crypto_ctx[packet::Epoch::Initial].crypto_stream.send;
+        let len = send.off_back() as usize;
+        assert_eq!(send.off_front(), send.off_back());
+        send.retransmit(0, len);
+        let mut bytes = vec![0; len];
+        assert_eq!(send.emit(&mut bytes), Ok((len, false)));
+        bytes
+    }
+    let mut config =
+        test_utils::Pipe::default_config_no_pq(cc_algorithm_name).unwrap();
+    config.enable_early_data();
+    config.enable_dgram(true, 8, 8);
+    config.set_initial_max_data(32_768);
+    config.set_initial_max_stream_data_bidi_remote(32_768);
+    let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
+    donor.handshake().unwrap();
+    let session = donor.client.session().unwrap().to_vec();
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.client.set_session(&session).unwrap();
+    let mut initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let client_hello = sent_client_hello(&mut pipe.client);
+    let hdr = Header::from_slice(&mut initial[0].0, MAX_CONN_ID_LEN).unwrap();
+    let original_dcid = hdr.dcid.clone();
+    let client_scid = hdr.scid.clone();
+    let scid = ConnectionId::from_ref(b"retry-early");
+    let data = vec![0x41; 8_000];
+    pipe.client.stream_send(0, &data, true).unwrap();
+    pipe.client.dgram_send(b"unreliable").unwrap();
+    // Everything in this flight is discarded by the stateless server.
+    test_utils::emit_flight(&mut pipe.client).unwrap();
+    let next_pn = pipe.client.next_pkt_num;
+    if lost_before_retry {
+        let handshake_status = pipe.client.handshake_status();
+        pipe.client
+            .paths
+            .get_active_mut()
+            .unwrap()
+            .recovery
+            .on_loss_detection_timeout(
+                handshake_status,
+                Instant::now(),
+                "retry-test",
+            );
+    }
+    let mut buf = [0; 65_535];
+    let len = packet::retry(
+        &client_scid,
+        &original_dcid,
+        &scid,
+        b"token",
+        PROTOCOL_VERSION,
+        &mut buf,
+    )
+    .unwrap();
+    let retry_packet = buf[..len].to_vec();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+    assert_eq!(pipe.client.next_pkt_num, next_pn);
+    assert_eq!(pipe.client.source_id(), client_scid);
+    assert_eq!(
+        pipe.client
+            .paths
+            .get_active()
+            .unwrap()
+            .recovery
+            .bytes_in_flight(),
+        0
+    );
+
+    pipe.server = accept(
+        &scid,
+        Some(&original_dcid),
+        test_utils::Pipe::server_addr(),
+        test_utils::Pipe::client_addr(),
+        &mut config,
+    )
+    .unwrap();
+    pipe.server.defer_early_data_handshake().unwrap();
+    // No timeout and no second stream_send: retransmit at the original offset.
+    let mut flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(sent_client_hello(&mut pipe.client), client_hello);
+    assert!(pipe.client.is_in_early_data());
+    let retried = Header::from_slice(&mut flight[0].0, MAX_CONN_ID_LEN).unwrap();
+    assert_eq!(retried.dcid, scid);
+    assert_eq!(retried.token.as_deref(), Some(b"token".as_slice()));
+    assert!(pipe.client.next_pkt_num > next_pn);
+    test_utils::process_flight(&mut pipe.server, flight.clone()).unwrap();
+    assert!(pipe.server.early_data_handshake_pending());
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((data.len(), true)));
+    assert_eq!(&buf[..data.len()], &data);
+    assert_eq!(pipe.server.dgram_recv(&mut buf), Err(Error::Done));
+    // Packet duplication and duplicate Retry cannot duplicate application
+    // bytes.
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Err(Error::Done));
+    let mut duplicate_retry = retry_packet;
+    pipe.client_recv(&mut duplicate_retry).unwrap();
+    pipe.advance().unwrap();
+    assert!(!pipe.client.is_established());
+    pipe.server.stream_send(0, b"AuthOk", false).unwrap();
+    pipe.server.release_early_data_handshake().unwrap();
+    pipe.advance().unwrap();
+    assert!(pipe.client.is_established());
+    assert!(pipe.client.early_data_accepted());
+    assert!(pipe.client.is_resumed());
+    assert_eq!(pipe.client.stream_recv(0, &mut buf), Ok((6, false)));
+}
+
+#[test]
+fn retry_after_authenticated_server_packet_is_ignored() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+    let dcid = pipe.client.destination_id().into_owned();
+    let scid = pipe.client.source_id().into_owned();
+    let mut buf = [0; 1500];
+    let n = packet::retry(
+        &scid,
+        &dcid,
+        &ConnectionId::from_ref(b"late-retry"),
+        b"token",
+        PROTOCOL_VERSION,
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..n]).unwrap();
+    assert!(!pipe.client.did_retry);
+    assert!(pipe.client.is_established());
+    assert_eq!(pipe.client.destination_id(), dcid);
+}
+
+#[rstest]
 fn retry_missing_original_destination_connection_id(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {

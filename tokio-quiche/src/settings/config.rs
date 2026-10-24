@@ -86,17 +86,21 @@ impl Config {
             make_pacing_offload(quic_settings, &socket_capabilities);
         let has_ippktinfo = socket_capabilities.has_ippktinfo;
         let has_ipv6pktinfo = socket_capabilities.has_ipv6pktinfo;
-        let server_config_profiles =
-            make_server_config_profiles(params, &socket_capabilities)?;
+        let quiche_config = make_quiche_config_with_settings(
+            quic_settings,
+            params.tls_cert,
+            &params.hooks,
+            None,
+            keylog_file.is_some(),
+        )?;
+        let server_config_profiles = make_server_config_profiles(
+            params,
+            &socket_capabilities,
+            &quiche_config,
+        )?;
 
         Ok(Config {
-            quiche_config: make_quiche_config_with_settings(
-                quic_settings,
-                params.tls_cert,
-                &params.hooks,
-                None,
-                keylog_file.is_some(),
-            )?,
+            quiche_config,
             disable_client_ip_validation: quic_settings
                 .disable_client_ip_validation,
             qlog_dir: quic_settings.qlog_dir.clone(),
@@ -237,6 +241,22 @@ fn make_quiche_config_with_settings(
         quic_settings.alpn.iter().map(Vec::as_slice).collect();
     config.set_application_protos(&alpns).unwrap();
 
+    if quic_settings.verify_peer {
+        config.verify_peer(true);
+    }
+    if quic_settings.enable_early_data {
+        config.enable_early_data();
+    }
+    if should_log_keys {
+        config.log_keys();
+    }
+
+    apply_transport_settings(config, quic_settings)
+}
+
+fn apply_transport_settings(
+    mut config: quiche::Config, quic_settings: &QuicSettings,
+) -> QuicResult<quiche::Config> {
     if let Some(timeout) = quic_settings.max_idle_timeout {
         let ms = timeout
             .as_millis()
@@ -287,10 +307,6 @@ fn make_quiche_config_with_settings(
         config.set_max_pacing_rate(max_pacing_rate);
     }
 
-    if quic_settings.verify_peer {
-        config.verify_peer(quic_settings.verify_peer);
-    }
-
     config.set_max_connection_window(quic_settings.max_connection_window);
     config.set_max_stream_window(quic_settings.max_stream_window);
     config.set_enable_send_streams_blocked(
@@ -314,38 +330,51 @@ fn make_quiche_config_with_settings(
             track_unknown_transport_params,
         );
     }
-    if quic_settings.enable_early_data {
-        config.enable_early_data();
-    }
-
-    if should_log_keys {
-        config.log_keys();
-    }
-
     Ok(config)
 }
 
 fn make_server_config_profiles(
     params: &ConnectionParams, socket_capabilities: &SocketCapabilities,
+    default_config: &quiche::Config,
 ) -> QuicResult<Vec<ServerProfileConfig>> {
     let mut profiles = Vec::with_capacity(params.server_config_profiles.len());
 
     for (profile_index, profile) in
         params.server_config_profiles.iter().enumerate()
     {
+        if profile.share_tls_context_with_default &&
+            (profile.tls_cert.is_some() ||
+                profile.alpn.is_some() ||
+                profile.verify_peer.is_some() ||
+                profile.enable_early_data.is_some() ||
+                profile.keylog_file.is_some())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a shared TLS profile cannot override TLS settings",
+            )
+            .into());
+        }
         let mut settings = params.settings.clone();
         profile.apply_to(&mut settings);
 
         let keylog_file =
             make_keylog_file(&settings, profile.keylog_file.is_none());
         let disable_client_ip_validation = settings.disable_client_ip_validation;
-        let quiche_config = make_quiche_config_with_settings(
-            &settings,
-            profile.tls_cert.or(params.tls_cert),
-            &params.hooks,
-            Some(profile_index),
-            keylog_file.is_some(),
-        )?;
+        let quiche_config = if profile.share_tls_context_with_default {
+            apply_transport_settings(
+                quiche::Config::with_shared_tls_context(default_config)?,
+                &settings,
+            )?
+        } else {
+            make_quiche_config_with_settings(
+                &settings,
+                profile.tls_cert.or(params.tls_cert),
+                &params.hooks,
+                Some(profile_index),
+                keylog_file.is_some(),
+            )?
+        };
         let pacing_offload = make_pacing_offload(&settings, socket_capabilities);
         let handshake_timeout = settings.handshake_timeout;
 
@@ -649,6 +678,74 @@ mod tests {
         let mut calls = calls.lock().unwrap().clone();
         calls.sort();
         assert_eq!(calls, vec![None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn shared_tls_profile_inherits_context_and_rejects_tls_overrides() {
+        struct DefaultOnly;
+        impl ConnectionHook for DefaultOnly {
+            fn create_custom_ssl_context_builder(
+                &self, _: Option<TlsCertificatePaths<'_>>, index: Option<usize>,
+            ) -> crate::QuicResult<Option<boring::ssl::SslContextBuilder>>
+            {
+                assert!(
+                    index.is_none(),
+                    "shared profile must reuse the default hook"
+                );
+                Ok(None)
+            }
+        }
+        let mut params = ConnectionParams::default();
+        params.hooks.connection_hook = Some(Arc::new(DefaultOnly));
+        params.settings.disable_client_ip_validation = true;
+        params.settings.enable_early_data = true;
+        params.server_config_profiles.push(ServerConfigOverrides {
+            share_tls_context_with_default: true,
+            disable_client_ip_validation: Some(false),
+            initial_max_data: Some(42),
+            ..Default::default()
+        });
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        assert_eq!(
+            config.server_profile_disable_client_ip_validation(None),
+            Some(true)
+        );
+        assert_eq!(
+            config.server_profile_disable_client_ip_validation(Some(0)),
+            Some(false)
+        );
+        for override_tls in [
+            ServerConfigOverrides {
+                alpn: Some(vec![b"other".to_vec()]),
+                ..Default::default()
+            },
+            ServerConfigOverrides {
+                enable_early_data: Some(false),
+                ..Default::default()
+            },
+            ServerConfigOverrides {
+                verify_peer: Some(true),
+                ..Default::default()
+            },
+            ServerConfigOverrides {
+                tls_cert: Some(TlsCertificatePaths {
+                    cert: TEST_CERT_FILE,
+                    private_key: TEST_KEY_FILE,
+                    kind: CertificateKind::X509,
+                }),
+                ..Default::default()
+            },
+            ServerConfigOverrides {
+                keylog_file: Some(Some("ignored".into())),
+                ..Default::default()
+            },
+        ] {
+            params.server_config_profiles[0] = ServerConfigOverrides {
+                share_tls_context_with_default: true,
+                ..override_tls
+            };
+            assert!(Config::new(&params, SocketCapabilities::default()).is_err());
+        }
     }
 
     #[test]

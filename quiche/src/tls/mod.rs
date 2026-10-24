@@ -131,6 +131,15 @@ pub static QUICHE_EX_DATA_INDEX: LazyLock<c_int> = LazyLock::new(|| unsafe {
 
 pub struct Context(NonNull<SSL_CTX>);
 
+impl Clone for Context {
+    fn clone(&self) -> Self {
+        // SAFETY: this context owns a live SSL_CTX. The new owner keeps one
+        // additional reference, released by Context::drop.
+        unsafe { SSL_CTX_up_ref(self.0.as_ptr()) };
+        Self(self.0)
+    }
+}
+
 impl Context {
     // Note: some vendor-specific methods are implemented in the boringssl
     // submodule.
@@ -1103,6 +1112,7 @@ extern "C" {
     // SSL_CTX
     fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
     fn SSL_CTX_free(ctx: *mut SSL_CTX);
+    fn SSL_CTX_up_ref(ctx: *mut SSL_CTX) -> c_int;
 
     fn SSL_CTX_use_certificate_chain_file(
         ctx: *mut SSL_CTX, file: *const c_char,

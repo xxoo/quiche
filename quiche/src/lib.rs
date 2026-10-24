@@ -634,6 +634,20 @@ impl Config {
         Self::with_tls_ctx(version, tls::Context::new()?)
     }
 
+    /// Creates a transport configuration sharing an existing TLS context.
+    ///
+    /// Certificates, verification, callbacks, ALPN, early-data policy and the
+    /// automatically rotated session ticket keys are shared. Only transport
+    /// settings should be changed on the returned configuration: TLS setters
+    /// modify the shared context and must not be called while it is in use.
+    /// Other transport settings start with their defaults.
+    pub fn with_shared_tls_context(source: &Config) -> Result<Config> {
+        let mut config =
+            Self::with_tls_ctx(source.version, source.tls_ctx.clone())?;
+        config.application_protos = source.application_protos.clone();
+        Ok(config)
+    }
+
     /// Creates a config object with the given version and
     /// [`SslContextBuilder`].
     ///
@@ -3154,8 +3168,9 @@ impl<F: BufFactory> Connection<F> {
                 return Err(Error::Done);
             }
 
-            // Ignore duplicate retry.
-            if self.did_retry {
+            // Ignore duplicate Retry or one arriving after a server packet
+            // has already been authenticated (RFC 9000, section 17.2.5.2).
+            if self.did_retry || self.recv_count > 0 {
                 return Err(Error::Done);
             }
 
@@ -3194,10 +3209,25 @@ impl<F: BufFactory> Connection<F> {
                 true,
             )?;
 
-            // Reset connection state to force sending another Initial packet.
-            self.drop_epoch_state(packet::Epoch::Initial, now);
+            // Retransmit the SAME ClientHello. Restarting TLS here would
+            // change its transcript and the 0-RTT keys, which Retry must
+            // preserve (RFC 9000, section 17.2.5.3).
+            let initial = &mut self.crypto_ctx[packet::Epoch::Initial];
+            let hello_len =
+                usize::try_from(initial.crypto_stream.send.off_back())
+                    .map_err(|_| Error::InvalidState)?;
+            initial.crypto_stream.send.retransmit(0, hello_len);
+            self.pkt_num_spaces[packet::Epoch::Initial].clear();
+            let handshake_status = self.handshake_status();
+            for (_, path) in self.paths.iter_mut() {
+                path.recovery.on_pkt_num_space_discarded(
+                    packet::Epoch::Initial,
+                    handshake_status,
+                    now,
+                );
+                path.recovery.on_retry(handshake_status, now);
+            }
             self.got_peer_conn_id = false;
-            self.handshake.clear()?;
 
             self.crypto_ctx[packet::Epoch::Initial].crypto_open = Some(aead_open);
             self.crypto_ctx[packet::Epoch::Initial].crypto_seal = Some(aead_seal);
@@ -8495,19 +8525,27 @@ impl<F: BufFactory> Connection<F> {
             }
 
             // We are ready to send data for this packet number space.
+            let pkt_type = if epoch == packet::Epoch::Application &&
+                !self.is_server &&
+                self.is_in_early_data()
+            {
+                Type::ZeroRTT
+            } else {
+                Type::from_epoch(epoch)
+            };
             if crypto_ctx.data_available() || pkt_space.ready() {
-                return Ok(Type::from_epoch(epoch));
+                return Ok(pkt_type);
             }
 
             // There are lost frames in this packet number space.
             for (_, p) in self.paths.iter() {
                 if p.recovery.has_lost_frames(epoch) {
-                    return Ok(Type::from_epoch(epoch));
+                    return Ok(pkt_type);
                 }
 
                 // We need to send PTO probe packets.
                 if p.recovery.loss_probes(epoch) > 0 {
-                    return Ok(Type::from_epoch(epoch));
+                    return Ok(pkt_type);
                 }
             }
         }

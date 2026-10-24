@@ -39,6 +39,14 @@ use super::TlsCertificatePaths;
 /// transport parameters, and per-connection observability.
 #[derive(Clone, Debug, Default)]
 pub struct ServerConfigOverrides<'a> {
+    /// Shares the default profile's TLS context and rotating ticket keys.
+    ///
+    /// The profile keeps its own transport settings and admission identity.
+    /// TLS overrides (`tls_cert`, `alpn`, `verify_peer`, `enable_early_data`,
+    /// `keylog_file`) are rejected and the profile-specific TLS builder hook
+    /// is not called. Use only for profiles with the same TLS identity and
+    /// policy, such as a tunnel with optional stateless Retry.
+    pub share_tls_context_with_default: bool,
     /// Optional TLS credentials for this profile.
     ///
     /// If unset, the profile inherits the listener's TLS credentials.

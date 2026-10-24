@@ -233,6 +233,10 @@ pub trait RecoveryOps {
         &mut self, epoch: packet::Epoch, handshake_status: HandshakeStatus,
         now: Instant,
     );
+    /// Requeue reliable 0-RTT frames immediately after a validated Retry.
+    /// Packet numbers and early-data keys belong to the connection and remain
+    /// unchanged. Discard the old flight without a congestion-loss penalty.
+    fn on_retry(&mut self, handshake_status: HandshakeStatus, now: Instant);
     fn on_path_change(
         &mut self, epoch: packet::Epoch, now: Instant, _trace_id: &str,
     ) -> (usize, usize);
