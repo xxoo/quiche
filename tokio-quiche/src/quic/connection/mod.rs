@@ -476,6 +476,16 @@ where
         self.params.server_initial_metadata.take()
     }
 
+    /// Requires application acceptance of 0-RTT before the final server flight.
+    ///
+    /// Configure this before [`Self::start`] or [`Self::handshake`]. The
+    /// application must call `quiche::Connection::release_early_data_handshake`
+    /// only after its early request has passed authentication. Fresh handshakes
+    /// are unaffected.
+    pub fn defer_early_data_handshake(&mut self) -> Result<(), quiche::Error> {
+        self.params.quiche_conn.defer_early_data_handshake()
+    }
+
     /// Rejects this connection before its I/O worker starts.
     ///
     /// Dropping the consumed owner releases its initial ingress-router

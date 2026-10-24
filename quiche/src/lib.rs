@@ -1346,6 +1346,13 @@ impl StreamsBlockedState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyDataHandshakeGate {
+    Disabled,
+    Pending,
+    Released,
+}
+
 /// A QUIC connection.
 pub struct Connection<F = DefaultBufFactory>
 where
@@ -1545,6 +1552,9 @@ where
 
     /// Whether the connection handshake has been completed.
     handshake_completed: bool,
+
+    /// Application decision required before sending the resumed server flight.
+    early_data_handshake_gate: EarlyDataHandshakeGate,
 
     /// Whether the HANDSHAKE_DONE frame has been sent.
     handshake_done_sent: bool,
@@ -2211,6 +2221,8 @@ impl<F: BufFactory> Connection<F> {
             parsed_peer_transport_params: false,
 
             handshake_completed: false,
+
+            early_data_handshake_gate: EarlyDataHandshakeGate::Disabled,
 
             handshake_done_sent: false,
             handshake_done_acked: false,
@@ -4169,6 +4181,16 @@ impl<F: BufFactory> Connection<F> {
         now: Instant, pkt_type: Type, bypass_cwnd: bool,
     ) -> Result<(Type, usize)> {
         let is_closing = self.local_error.is_some();
+
+        // Initial ACKs/ServerHello remain sendable while the application reads
+        // 0-RTT. Withhold the server Finished and all 1-RTT packets until the
+        // application accepts this connection. This also covers PTO probes.
+        if self.early_data_handshake_pending() &&
+            pkt_type != Type::Initial &&
+            !is_closing
+        {
+            return Err(Error::Done);
+        }
 
         let out_len = out.len();
 
@@ -7718,8 +7740,9 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::Done);
         }
 
-        let is_safe_to_send_app_data =
-            self.is_established() || self.is_in_early_data();
+        let is_safe_to_send_app_data = (self.is_established() ||
+            self.is_in_early_data()) &&
+            !self.early_data_handshake_pending();
 
         if app && !is_safe_to_send_app_data {
             // Clear error information.
@@ -7893,6 +7916,57 @@ impl<F: BufFactory> Connection<F> {
     #[inline]
     pub fn is_established(&self) -> bool {
         self.handshake_completed
+    }
+
+    /// Defers the resumed server's final handshake flight until the
+    /// application accepts its early data.
+    ///
+    /// Call this on a server before emitting any packets. Fresh handshakes
+    /// are unaffected. For an accepted 0-RTT handshake, Initial packets remain
+    /// sendable, but Handshake and 1-RTT packets are withheld. The application
+    /// must read and validate early data, then call
+    /// [`release_early_data_handshake()`]. It may queue the corresponding
+    /// response before releasing the gate to send it with the final flight.
+    /// Rejection must close the connection; it never releases the gate.
+    ///
+    /// [`release_early_data_handshake()`]: Self::release_early_data_handshake
+    pub fn defer_early_data_handshake(&mut self) -> Result<()> {
+        if !self.is_server || self.sent_count != 0 || self.is_established() {
+            return Err(Error::InvalidState);
+        }
+        match self.early_data_handshake_gate {
+            EarlyDataHandshakeGate::Disabled => {
+                self.early_data_handshake_gate = EarlyDataHandshakeGate::Pending;
+                Ok(())
+            },
+            EarlyDataHandshakeGate::Pending |
+            EarlyDataHandshakeGate::Released => Err(Error::InvalidState),
+        }
+    }
+
+    /// Returns whether accepted early data is holding the final server flight.
+    pub fn early_data_handshake_pending(&self) -> bool {
+        self.early_data_handshake_gate == EarlyDataHandshakeGate::Pending &&
+            (self.is_in_early_data() || self.early_data_accepted())
+    }
+
+    /// Allows the final resumed server flight after application authentication.
+    ///
+    /// The application must subsequently drain [`send()`] as usual. This is a
+    /// one-way transition and cannot reopen a closed or rejected connection.
+    ///
+    /// [`send()`]: Self::send
+    pub fn release_early_data_handshake(&mut self) -> Result<()> {
+        if !self.early_data_handshake_pending() ||
+            self.local_error.is_some() ||
+            self.peer_error.is_some() ||
+            self.is_closed() ||
+            self.is_draining()
+        {
+            return Err(Error::InvalidState);
+        }
+        self.early_data_handshake_gate = EarlyDataHandshakeGate::Released;
+        Ok(())
     }
 
     /// Returns true if the connection is resumed.

@@ -851,6 +851,84 @@ fn handshake_resumption(
 }
 
 #[test]
+fn early_data_handshake_gate_requires_application_acceptance() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_early_data();
+    config.set_ticket_key(&[0x5a; 48]).unwrap();
+    let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
+    donor.server.defer_early_data_handshake().unwrap();
+    donor.handshake().unwrap();
+    assert!(!donor.server.early_data_handshake_pending());
+    let session = donor.client.session().unwrap().to_vec();
+
+    for accept in [true, false] {
+        let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+        pipe.server.defer_early_data_handshake().unwrap();
+        pipe.client.set_session(&session).unwrap();
+        let initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+        assert!(pipe.client.is_in_early_data());
+        assert_eq!(pipe.client.stream_send(0, b"Auth", false), Ok(4));
+        let early = test_utils::emit_flight(&mut pipe.client).unwrap();
+        test_utils::process_flight(&mut pipe.server, initial).unwrap();
+        // The server may emit Initial ACKs/ServerHello even before Auth
+        // arrives.
+        let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+        test_utils::process_flight(&mut pipe.client, flight).unwrap();
+        assert!(!pipe.client.is_established());
+        test_utils::process_flight(&mut pipe.server, early).unwrap();
+        assert!(pipe.server.early_data_handshake_pending());
+        let mut buf = [0; 65535];
+        assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((4, false)));
+        assert_eq!(&buf[..4], b"Auth");
+        // Repeated pumps and a Handshake PTO probe cannot bypass the gate.
+        for _ in 0..3 {
+            pipe.advance().unwrap();
+            assert!(!pipe.client.is_established());
+            assert!(!pipe.server.is_established());
+        }
+        assert_eq!(
+            pipe.server.send_single_for_type(
+                &mut buf,
+                0,
+                false,
+                Instant::now(),
+                Type::Handshake,
+                true,
+            ),
+            Err(Error::Done)
+        );
+        if accept {
+            assert_eq!(pipe.server.stream_send(0, b"AuthOk", false), Ok(6));
+            pipe.server.release_early_data_handshake().unwrap();
+            let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+            test_utils::process_flight(&mut pipe.client, flight).unwrap();
+            assert!(pipe.client.is_established());
+            assert!(!pipe.server.is_established());
+            assert_eq!(pipe.client.stream_recv(0, &mut buf), Ok((6, false)));
+            assert_eq!(&buf[..6], b"AuthOk");
+            pipe.advance().unwrap();
+            assert!(pipe.server.is_established());
+            assert_eq!(
+                pipe.server.release_early_data_handshake(),
+                Err(Error::InvalidState)
+            );
+        } else {
+            pipe.server.close(true, 42, b"private reason").unwrap();
+            assert_eq!(
+                pipe.server.release_early_data_handshake(),
+                Err(Error::InvalidState)
+            );
+            pipe.advance().unwrap();
+            assert!(!pipe.client.is_established());
+            let error = pipe.client.peer_error().unwrap();
+            assert!(!error.is_app);
+            assert_eq!(error.error_code, 0x0c);
+            assert!(error.reason.is_empty());
+        }
+    }
+}
+
+#[test]
 fn early_data_accepted_verdicts() {
     const SESSION_TICKET_KEY: [u8; 48] = [0xb; 48];
 
