@@ -613,6 +613,8 @@ pub struct Config {
 
     disable_initial_close: bool,
 
+    retry_public_key: Option<Arc<retry_protection::PublicKey>>,
+
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
@@ -709,6 +711,8 @@ impl Config {
 
             disable_initial_close: false,
 
+            retry_public_key: None,
+
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
         })
@@ -724,6 +728,16 @@ impl Config {
     /// connection is created. It is not negotiated with the peer.
     pub fn set_disable_initial_close(&mut self, enabled: bool) {
         self.disable_initial_close = enabled;
+    }
+
+    /// Requires an authenticated Retry proof before adopting any Retry state.
+    /// None preserves standard Retry handling, including opaque enhanced
+    /// tokens. The key is frozen when the connection is created and is never
+    /// negotiated.
+    pub fn set_retry_public_key(
+        &mut self, key: Option<Arc<retry_protection::PublicKey>>,
+    ) {
+        self.retry_public_key = key;
     }
 
     /// Configures the given certificate chain.
@@ -1549,6 +1563,8 @@ where
     /// Fixed policy for publicly forgeable Initial CONNECTION_CLOSE frames.
     disable_initial_close: bool,
 
+    retry_public_key: Option<Arc<retry_protection::PublicKey>>,
+
     /// The connection-level limit at which send blocking occurred.
     blocked_limit: Option<u64>,
 
@@ -2234,6 +2250,8 @@ impl<F: BufFactory> Connection<F> {
             peer_error_packet_type: None,
 
             disable_initial_close: config.disable_initial_close,
+
+            retry_public_key: config.retry_public_key.clone(),
 
             blocked_limit: None,
 
@@ -3209,6 +3227,25 @@ impl<F: BufFactory> Connection<F> {
             .is_err()
             {
                 return Err(Error::Done);
+            }
+
+            // Retain standard checks even when proof verification is disabled.
+            if hdr.version != self.version ||
+                hdr.scid == self.destination_id() ||
+                hdr.token.as_ref().is_none_or(|token| token.is_empty())
+            {
+                return Err(Error::Done);
+            }
+            if let Some(key) = &self.retry_public_key {
+                let binding = retry_protection::Binding {
+                    version: self.version,
+                    original_dcid: &self.destination_id(),
+                    client_scid: &self.source_id(),
+                    retry_scid: &hdr.scid,
+                };
+                if key.verify(hdr.token.as_deref().unwrap(), binding).is_err() {
+                    return Err(Error::Done);
+                }
             }
 
             trace!("{} rx pkt {:?}", self.trace_id, hdr);
@@ -10122,9 +10159,12 @@ mod packet;
 mod path;
 mod pmtud;
 mod rand;
+
 mod range_buf;
 mod ranges;
 mod recovery;
+/// Optional authenticated, opaque Retry token envelopes.
+pub mod retry_protection;
 mod stream;
 mod tls;
 mod transport_params;

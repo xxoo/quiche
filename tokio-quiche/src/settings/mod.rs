@@ -52,6 +52,8 @@ use std::sync::Arc;
 pub struct ConnectionParams<'a> {
     /// QUIC connection settings.
     pub settings: QuicSettings,
+    /// Optional Retry verifier. None keeps standard opaque-token handling.
+    pub retry_public_key: Option<Arc<quiche::retry_protection::PublicKey>>,
     /// Optional TLS credentials to authenticate with.
     pub tls_cert: Option<TlsCertificatePaths<'a>>,
     /// Hooks to use for the connection.
@@ -115,6 +117,7 @@ impl<'a> Default for ConnectionParams<'a> {
     fn default() -> Self {
         Self {
             settings: QuicSettings::default(),
+            retry_public_key: None,
             tls_cert: None,
             hooks: Hooks::default(),
             server_config_profiles: Vec::new(),
@@ -159,6 +162,7 @@ impl<'a> ConnectionParams<'a> {
     ) -> Self {
         Self {
             settings,
+            retry_public_key: None,
             tls_cert: Some(tls_cert),
             hooks,
             server_config_profiles: Vec::new(),
@@ -182,6 +186,7 @@ impl<'a> ConnectionParams<'a> {
     ) -> Self {
         Self {
             settings,
+            retry_public_key: None,
             tls_cert,
             hooks,
             server_config_profiles: Vec::new(),

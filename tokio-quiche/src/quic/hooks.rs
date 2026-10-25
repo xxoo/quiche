@@ -106,6 +106,15 @@ pub trait ConnectionHook {
         StatelessRetryDecision::Allow
     }
 
+    /// Current Retry identity for the selected profile. None uses standard
+    /// opaque tokens. Called once per Initial; keep publication atomic and
+    /// reject business admission until authoritative key state is available.
+    fn retry_signing_identity(
+        &self, _profile_index: Option<usize>,
+    ) -> Option<std::sync::Arc<quiche::retry_protection::SigningIdentity>> {
+        None
+    }
+
     /// Whether a connection using this server config profile must keep the
     /// source IP from its accepted Initial packet.
     ///

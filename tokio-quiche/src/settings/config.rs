@@ -86,13 +86,14 @@ impl Config {
             make_pacing_offload(quic_settings, &socket_capabilities);
         let has_ippktinfo = socket_capabilities.has_ippktinfo;
         let has_ipv6pktinfo = socket_capabilities.has_ipv6pktinfo;
-        let quiche_config = make_quiche_config_with_settings(
+        let mut quiche_config = make_quiche_config_with_settings(
             quic_settings,
             params.tls_cert,
             &params.hooks,
             None,
             keylog_file.is_some(),
         )?;
+        quiche_config.set_retry_public_key(params.retry_public_key.clone());
         let server_config_profiles = make_server_config_profiles(
             params,
             &socket_capabilities,

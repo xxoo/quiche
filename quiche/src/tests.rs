@@ -6921,7 +6921,16 @@ fn retry(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
 #[rstest]
 fn retry_with_pto(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(false, true)] protected: bool,
 ) {
+    use crate::retry_protection::Binding;
+    use crate::retry_protection::SigningIdentity;
+    use crate::retry_protection::Suite;
+    let identity = SigningIdentity::from_seed(
+        Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+        &[7; 32],
+    )
+    .unwrap();
     let mut buf = [0; 65535];
 
     let mut config = Config::new(PROTOCOL_VERSION).unwrap();
@@ -6936,35 +6945,43 @@ fn retry_with_pto(
         .set_application_protos(&[b"proto1", b"proto2"])
         .unwrap();
 
-    let mut pipe = test_utils::Pipe::with_server_config(&mut config).unwrap();
+    if protected {
+        config.set_retry_public_key(Some(Arc::new(identity.public_key())));
+    }
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
 
     // Client sends initial flight.
     let (mut len, _) = pipe.client.send(&mut buf).unwrap();
-
-    // Server sends Retry packet.
     let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
-
     let odcid = hdr.dcid.clone();
-
     let mut scid = [0; MAX_CONN_ID_LEN];
     rand::rand_bytes(&mut scid[..]);
     let scid = ConnectionId::from_ref(&scid);
-
-    let token = b"quiche test retry token";
-
+    let token = if protected {
+        identity
+            .seal(
+                Binding {
+                    version: hdr.version,
+                    original_dcid: &odcid,
+                    client_scid: &hdr.scid,
+                    retry_scid: &scid,
+                },
+                b"quiche test retry token",
+            )
+            .unwrap()
+    } else {
+        b"quiche test retry token".to_vec()
+    };
     len =
-        packet::retry(&hdr.scid, &hdr.dcid, &scid, token, hdr.version, &mut buf)
+        packet::retry(&hdr.scid, &hdr.dcid, &scid, &token, hdr.version, &mut buf)
             .unwrap();
-
-    // Client receives Retry and sends new Initial.
     assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
-
+    let duplicate_retry = buf[..len].to_vec();
     let (len, send_info) = pipe.client.send(&mut buf).unwrap();
-
     let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
-    assert_eq!(&hdr.token.unwrap(), token);
+    assert_eq!(hdr.token.as_deref(), Some(token.as_slice()));
 
-    // Server accepts connection.
+    // Lose this Initial and recover with PTO, keeping the exact signed token.
     pipe.server = accept(
         &scid,
         Some(&odcid),
@@ -6973,8 +6990,6 @@ fn retry_with_pto(
         &mut config,
     )
     .unwrap();
-    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
-
     // Wait for the client's PTO so it will try to send an Initial again.
     let timer = pipe.client.timeout().unwrap();
     std::thread::sleep(timer + Duration::from_millis(1));
@@ -6984,13 +6999,27 @@ fn retry_with_pto(
 
     assert!(pipe.client.is_established());
     assert!(pipe.server.is_established());
+    // A delayed Retry after authenticated packets cannot restart the attempt.
+    let mut duplicate_retry = duplicate_retry;
+    pipe.client_recv(&mut duplicate_retry).unwrap();
+    assert!(pipe.client.is_established());
+    assert_eq!(pipe.client.token.as_deref(), Some(token.as_slice()));
 }
 
 #[rstest]
 fn retry_resends_early_stream_before_finished_without_pto(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
     #[values(false, true)] lost_before_retry: bool,
+    #[values(false, true)] protected: bool,
 ) {
+    use crate::retry_protection::Binding;
+    use crate::retry_protection::SigningIdentity;
+    use crate::retry_protection::Suite;
+    let identity = SigningIdentity::from_seed(
+        Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+        &[7; 32],
+    )
+    .unwrap();
     fn sent_client_hello(conn: &mut Connection) -> Vec<u8> {
         let send =
             &mut conn.crypto_ctx[packet::Epoch::Initial].crypto_stream.send;
@@ -7007,6 +7036,9 @@ fn retry_resends_early_stream_before_finished_without_pto(
     config.enable_dgram(true, 8, 8);
     config.set_initial_max_data(32_768);
     config.set_initial_max_stream_data_bidi_remote(32_768);
+    if protected {
+        config.set_retry_public_key(Some(Arc::new(identity.public_key())));
+    }
     let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
     donor.handshake().unwrap();
     let session = donor.client.session().unwrap().to_vec();
@@ -7039,11 +7071,26 @@ fn retry_resends_early_stream_before_finished_without_pto(
             );
     }
     let mut buf = [0; 65_535];
+    let token = if protected {
+        identity
+            .seal(
+                Binding {
+                    version: PROTOCOL_VERSION,
+                    original_dcid: &original_dcid,
+                    client_scid: &client_scid,
+                    retry_scid: &scid,
+                },
+                b"token",
+            )
+            .unwrap()
+    } else {
+        b"token".to_vec()
+    };
     let len = packet::retry(
         &client_scid,
         &original_dcid,
         &scid,
-        b"token",
+        &token,
         PROTOCOL_VERSION,
         &mut buf,
     )
@@ -7077,7 +7124,7 @@ fn retry_resends_early_stream_before_finished_without_pto(
     assert!(pipe.client.is_in_early_data());
     let retried = Header::from_slice(&mut flight[0].0, MAX_CONN_ID_LEN).unwrap();
     assert_eq!(retried.dcid, scid);
-    assert_eq!(retried.token.as_deref(), Some(b"token".as_slice()));
+    assert_eq!(retried.token.as_deref(), Some(token.as_slice()));
     assert!(pipe.client.next_pkt_num > next_pn);
     test_utils::process_flight(&mut pipe.server, flight.clone()).unwrap();
     assert!(pipe.server.early_data_handshake_pending());
@@ -10908,10 +10955,18 @@ fn initial_close_policy_retains_tls_error_without_sending_initial_close() {
 
 #[rstest]
 fn initial_close_only_forgery_does_not_poison_retry_or_timers(
-    #[values(false, true)] resumed: bool,
+    #[values(false, true)] resumed: bool, #[values(false, true)] protected: bool,
 ) {
     let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_disable_initial_close(true);
+    let identity = retry_protection::SigningIdentity::from_seed(
+        retry_protection::Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+        &[7; 32],
+    )
+    .unwrap();
+    if protected {
+        config.set_retry_public_key(Some(Arc::new(identity.public_key())));
+    }
     config.enable_early_data();
     let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
     donor.handshake().unwrap();
@@ -10959,11 +11014,26 @@ fn initial_close_only_forgery_does_not_poison_retry_or_timers(
         assert!(pipe.client.peer_error().is_none());
     }
     let retry_scid = ConnectionId::from_ref(&[0x5a; 16]);
+    let token = if protected {
+        identity
+            .seal(
+                retry_protection::Binding {
+                    version: hdr.version,
+                    original_dcid: &hdr.dcid,
+                    client_scid: &hdr.scid,
+                    retry_scid: &retry_scid,
+                },
+                b"token",
+            )
+            .unwrap()
+    } else {
+        b"token".to_vec()
+    };
     let len = super::retry(
         &hdr.scid,
         &hdr.dcid,
         &retry_scid,
-        b"token",
+        &token,
         hdr.version,
         &mut buf,
     )
@@ -15576,4 +15646,132 @@ fn server_qlog() {
     } else {
         panic!("expected Qlog event");
     }
+}
+
+#[rstest]
+fn authenticated_retry_compatible_with_ordinary_client(
+    #[values(false, true)] verify: bool,
+) {
+    use crate::retry_protection::Binding;
+    use crate::retry_protection::SigningIdentity;
+    use crate::retry_protection::Suite;
+    let identity = SigningIdentity::from_seed(
+        Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+        &[7; 32],
+    )
+    .unwrap();
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    if verify {
+        config.set_retry_public_key(Some(Arc::new(identity.public_key())));
+    }
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    let mut buf = vec![0; 1500];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
+    let retry_scid = ConnectionId::from_ref(b"authenticated-retry");
+    let token = identity
+        .seal(
+            Binding {
+                version: hdr.version,
+                original_dcid: &hdr.dcid,
+                client_scid: &hdr.scid,
+                retry_scid: &retry_scid,
+            },
+            b"address token",
+        )
+        .unwrap();
+    let len = super::retry(
+        &hdr.scid,
+        &hdr.dcid,
+        &retry_scid,
+        &token,
+        hdr.version,
+        &mut buf,
+    )
+    .unwrap();
+    assert!(len <= 319);
+    pipe.client_recv(&mut buf[..len]).unwrap();
+    assert!(pipe.client.did_retry);
+    // Duplicates cannot reset state; the ordinary client echoes all 256 bytes.
+    pipe.client_recv(&mut buf[..len]).unwrap();
+    let (len, info) = pipe.client.send(&mut buf).unwrap();
+    let retried = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
+    assert_eq!(retried.token.as_deref(), Some(token.as_slice()));
+    pipe.server = accept(
+        &retry_scid,
+        Some(&hdr.dcid),
+        test_utils::Pipe::server_addr(),
+        info.from,
+        &mut config,
+    )
+    .unwrap();
+    pipe.server_recv(&mut buf[..len]).unwrap();
+    pipe.advance().unwrap();
+    assert!(pipe.client.is_established() && pipe.server.is_established());
+}
+
+#[test]
+fn forged_retry_with_valid_standard_tag_cannot_mutate_client() {
+    use crate::retry_protection::Binding;
+    use crate::retry_protection::SigningIdentity;
+    use crate::retry_protection::Suite;
+    let identity = SigningIdentity::from_seed(
+        Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+        &[7; 32],
+    )
+    .unwrap();
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_retry_public_key(Some(Arc::new(identity.public_key())));
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    let mut buf = vec![0; 1500];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let hdr = Header::from_slice(&mut buf[..len], MAX_CONN_ID_LEN).unwrap();
+    let scid = ConnectionId::from_ref(b"signed-retry");
+    let binding = Binding {
+        version: hdr.version,
+        original_dcid: &hdr.dcid,
+        client_scid: &hdr.scid,
+        retry_scid: &scid,
+    };
+    let good = identity.seal(binding, b"raw").unwrap();
+    let mut altered = good.clone();
+    altered[40] ^= 1;
+    let wrong = identity
+        .seal(
+            Binding {
+                original_dcid: b"different-attempt",
+                ..binding
+            },
+            b"raw",
+        )
+        .unwrap();
+    let idle = pipe.client.idle_timer;
+    for token in [
+        vec![0; 256],
+        b"standard-token".to_vec(),
+        altered,
+        wrong,
+        vec![],
+    ] {
+        let len = super::retry(
+            &hdr.scid,
+            &hdr.dcid,
+            &scid,
+            &token,
+            hdr.version,
+            &mut buf,
+        )
+        .unwrap();
+        pipe.client_recv(&mut buf[..len]).unwrap();
+        assert!(!pipe.client.did_retry);
+        assert_eq!(pipe.client.destination_id(), hdr.dcid);
+        assert_eq!(pipe.client.idle_timer, idle);
+        assert_eq!(pipe.client.recv_count, 0);
+        assert!(pipe.client.token.is_none());
+    }
+    let len =
+        super::retry(&hdr.scid, &hdr.dcid, &scid, &good, hdr.version, &mut buf)
+            .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+    assert!(pipe.client.did_retry);
 }

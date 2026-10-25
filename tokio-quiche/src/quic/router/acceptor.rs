@@ -255,10 +255,24 @@ where
 
     fn stateless_retry(
         &mut self, incoming: Incoming, hdr: Header,
+        identity: Option<&quiche::retry_protection::SigningIdentity>,
     ) -> io::Result<Option<NewConnection>> {
         let scid = self.cid_generator.new_connection_id();
 
-        let token = self.token_manager.gen(&hdr.dcid, incoming.peer_addr);
+        let raw = self.token_manager.gen(&hdr.dcid, incoming.peer_addr);
+        let token = match identity {
+            Some(identity) => identity.seal(
+                quiche::retry_protection::Binding {
+                    version: hdr.version,
+                    original_dcid: &hdr.dcid,
+                    client_scid: &hdr.scid,
+                    retry_scid: &scid,
+                },
+                &raw,
+            ),
+            None => self.token_manager.cover.seal(&raw),
+        }
+        .map_err(io::Error::other)?;
 
         self.handshake_reply(incoming, move |buf| {
             quiche::retry(&hdr.scid, &hdr.dcid, &scid, &token, hdr.version, buf)
@@ -328,6 +342,12 @@ where
             );
         }
 
+        let identity = self
+            .config
+            .connection_hook
+            .as_ref()
+            .and_then(|hook| hook.retry_signing_identity(profile_index));
+
         // NOTE: token is always present in Initial packets
         let token = hdr.token.as_ref().unwrap();
         if token.is_empty() {
@@ -338,16 +358,41 @@ where
             {
                 return Ok(None);
             }
-            return self.stateless_retry(incoming, hdr);
+            return self.stateless_retry(incoming, hdr, identity.as_deref());
         }
 
+        let (raw, signed_odcid) = match identity {
+            Some(identity) => {
+                let proof = identity
+                    .public_key()
+                    .open(token, hdr.version, &hdr.scid, &hdr.dcid)
+                    .map_err(|_| {
+                        labels::QuicInvalidInitialPacketError::TokenValidationFail
+                    })?;
+                (proof.address_token, Some(proof.original_dcid))
+            },
+            None => (
+                self.token_manager.cover.open(token).map_err(|_| {
+                    labels::QuicInvalidInitialPacketError::TokenValidationFail
+                })?,
+                None,
+            ),
+        };
         let original_dcid = self
             .token_manager
-            .validate_and_extract_original_dcid(token, incoming.peer_addr)
+            .validate_and_extract_original_dcid(&raw, incoming.peer_addr)
             .or(Err(
                 labels::QuicInvalidInitialPacketError::TokenValidationFail,
             ))?;
 
+        if signed_odcid
+            .as_deref()
+            .is_some_and(|signed| signed != original_dcid.as_ref())
+        {
+            return Err(
+                labels::QuicInvalidInitialPacketError::TokenValidationFail.into(),
+            );
+        }
         let retry_cids = Some(RetryConnectionIds {
             original_destination_cid: &original_dcid,
             retry_source_cid: &hdr.dcid,
@@ -437,6 +482,7 @@ mod tests {
     }
 
     struct RetryHook {
+        identity: Mutex<Option<Arc<quiche::retry_protection::SigningIdentity>>>,
         decision: StatelessRetryDecision,
         selected_profile: Option<usize>,
         calls: Mutex<Vec<(Option<usize>, IpAddr)>>,
@@ -448,6 +494,12 @@ mod tests {
             _profile_index: Option<usize>,
         ) -> QuicResult<Option<SslContextBuilder>> {
             Ok(None)
+        }
+
+        fn retry_signing_identity(
+            &self, _: Option<usize>,
+        ) -> Option<Arc<quiche::retry_protection::SigningIdentity>> {
+            self.identity.lock().unwrap().clone()
         }
 
         fn stateless_retry_decision(
@@ -556,6 +608,7 @@ mod tests {
         disable_client_ip_validation: bool, selected_profile: Option<usize>,
     ) -> RetryHarness {
         let hook = Arc::new(RetryHook {
+            identity: Mutex::new(None),
             decision,
             selected_profile,
             calls: Mutex::new(Vec::new()),
@@ -645,6 +698,15 @@ mod tests {
                 .acceptor
                 .token_manager
                 .gen(&header.dcid, incoming.peer_addr),
+        );
+
+        header.token = Some(
+            harness
+                .acceptor
+                .token_manager
+                .cover
+                .seal(header.token.as_deref().unwrap())
+                .unwrap(),
         );
 
         let accepted = harness
@@ -761,6 +823,69 @@ mod tests {
         assert_eq!(harness.hook.calls.lock().unwrap().len(), 1);
         assert_eq!(harness.cid_generator.0.load(Ordering::Relaxed), 1);
         assert_eq!(harness.sender.calls.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn enhanced_retry_retains_address_validation_and_current_key_policy() {
+        use quiche::retry_protection::*;
+        for mode in 0..5 {
+            let mut harness =
+                retry_acceptor(StatelessRetryDecision::Allow, false);
+            let identity = Arc::new(
+                SigningIdentity::from_seed(
+                    Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+                    &[7; 32],
+                )
+                .unwrap(),
+            );
+            *harness.hook.identity.lock().unwrap() = Some(identity.clone());
+            let (mut incoming, mut header) = initial_packet();
+            let original = b"original-dcid";
+            let raw = if mode == 1 {
+                vec![0; 60]
+            } else {
+                harness
+                    .acceptor
+                    .token_manager
+                    .gen(original, incoming.peer_addr)
+            };
+            let token = identity
+                .seal(
+                    Binding {
+                        version: header.version,
+                        original_dcid: original,
+                        client_scid: &header.scid,
+                        retry_scid: &header.dcid,
+                    },
+                    &raw,
+                )
+                .unwrap();
+            header.token = Some(token);
+            if mode == 2 {
+                incoming.peer_addr = "192.0.2.9:1234".parse().unwrap();
+            }
+            if mode == 3 {
+                *harness.hook.identity.lock().unwrap() = Some(Arc::new(
+                    SigningIdentity::from_seed(
+                        Suite::Ed25519HkdfSha256XChaCha20Poly1305,
+                        &[8; 32],
+                    )
+                    .unwrap(),
+                ));
+            }
+            if mode == 4 {
+                *harness.hook.identity.lock().unwrap() = None;
+            }
+            let result = harness.acceptor.handle_initials(
+                incoming,
+                header,
+                &mut harness.config,
+            );
+            if mode == 0 {
+                assert!(result.unwrap().is_some());
+            } else {
+                assert!(result.is_err());
+            }
+        }
     }
 }
 

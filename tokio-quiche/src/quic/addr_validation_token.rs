@@ -44,6 +44,7 @@ const TOKEN_VALIDITY: Duration = Duration::from_secs(30);
 pub(crate) struct AddrValidationTokenManager {
     sign_key: [u8; HMAC_KEY_LEN],
     epoch: Instant,
+    pub(super) cover: quiche::retry_protection::OpaqueTokenKey,
 }
 
 impl Default for AddrValidationTokenManager {
@@ -54,6 +55,8 @@ impl Default for AddrValidationTokenManager {
         AddrValidationTokenManager {
             sign_key: key_bytes,
             epoch: Instant::now(),
+            cover: quiche::retry_protection::OpaqueTokenKey::new()
+                .expect("secure randomness required for address tokens"),
         }
     }
 }
