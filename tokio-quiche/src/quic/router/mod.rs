@@ -2028,6 +2028,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_zero_rtt_stream_fallback_is_opt_in() {
+        let mut server_params = ConnectionParams::new_server(
+            test_quic_settings(),
+            TlsCertificatePaths {
+                cert: TEST_CERT_FILE,
+                private_key: TEST_KEY_FILE,
+                kind: crate::settings::CertificateKind::X509,
+            },
+            Hooks::default(),
+        );
+        server_params.settings.enable_early_data = false;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = socket.local_addr().unwrap();
+        let mut incoming = crate::listen([socket], server_params, DefaultMetrics)
+            .unwrap().pop().unwrap();
+        let server = tokio::spawn(async move {
+            while let Some(Ok(conn)) = incoming.next().await {
+                conn.start(TestApp::new(None, None));
+            }
+        });
+        let mut params = ConnectionParams::new_client(
+            test_quic_settings(), None, Hooks::default(),
+        );
+        let (session_tx, session_rx) = oneshot::channel();
+        let _donor = connect_test_client(
+            endpoint, &params, TestApp::new(Some(session_tx), None),
+        ).await.unwrap();
+        params.session = time::timeout(Duration::from_secs(5), session_rx)
+            .await.unwrap().unwrap();
+        assert!(params.session.is_some());
+        params.zero_rtt_streams = vec![ZeroRttStream {
+            data: b"retained by the application".to_vec(),
+            fin: false,
+        }];
+        assert!(!params.allow_early_data_fallback);
+        assert!(connect_test_client(endpoint, &params, TestApp::new(None, None))
+            .await.is_err());
+        params.allow_early_data_fallback = true;
+        let (tx, rx) = oneshot::channel();
+        let _connection = connect_test_client(
+            endpoint, &params, TestApp::new(Some(tx), None),
+        ).await.unwrap();
+        assert!(time::timeout(Duration::from_secs(5), rx)
+            .await.unwrap().unwrap().is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn early_peer_close_is_published_before_connect_returns_error() {
         let tls_cert_settings = TlsCertificatePaths {
             cert: TEST_CERT_FILE,

@@ -8241,7 +8241,7 @@ impl<F: BufFactory> Connection<F> {
     }
 
     fn parse_peer_transport_params(
-        &mut self, peer_params: TransportParams,
+        &mut self, peer_params: TransportParams, now: Instant,
     ) -> Result<()> {
         // Validate initial_source_connection_id.
         match &peer_params.initial_source_connection_id {
@@ -8286,6 +8286,25 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // EncryptedExtensions has settled the TLS early-data verdict. Discard
+        // rejected 0-RTT stream/recovery state before installing the new limits
+        // or receiving any 1-RTT application bytes (RFC 9001, section 4.6.2).
+        // Keep packet numbers and keys: 0-RTT and 1-RTT share a number space.
+        if !self.is_server && !self.handshake.early_data_accepted() {
+            self.streams.discard_early_data();
+            self.tx_data = 0;
+            self.last_tx_data = 0;
+            self.blocked_limit = None;
+            self.dgram_send_queue.purge(|_| true);
+            let handshake_status = self.handshake_status();
+            for (_, path) in self.paths.iter_mut() {
+                path.recovery.on_pkt_num_space_discarded(
+                    packet::Epoch::Application,
+                    handshake_status,
+                    now,
+                );
+            }
+        }
         self.process_peer_transport_params(peer_params)?;
 
         self.parsed_peer_transport_params = true;
@@ -8435,7 +8454,7 @@ impl<F: BufFactory> Connection<F> {
                     self.peer_transport_params_track_unknown,
                 )?;
 
-                self.parse_peer_transport_params(peer_params)?;
+                self.parse_peer_transport_params(peer_params, now)?;
             }
 
             return Ok(());
@@ -8454,7 +8473,7 @@ impl<F: BufFactory> Connection<F> {
                 self.peer_transport_params_track_unknown,
             )?;
 
-            self.parse_peer_transport_params(peer_params)?;
+            self.parse_peer_transport_params(peer_params, now)?;
         }
 
         if self.handshake_completed {

@@ -979,6 +979,90 @@ fn early_data_accepted_verdicts() {
 }
 
 #[rstest]
+fn rejected_early_data_discards_streams_without_reopening_connection(
+    #[values("cubic", "bbr2_gcongestion")] cc: &str,
+    #[values("disabled", "rotated", "hrr")] rejection: &str,
+) {
+    const KEY: [u8; 48] = [0x47; 48];
+    let mut donor_config = test_utils::Pipe::default_config(cc).unwrap();
+    donor_config.set_ticket_key(&KEY).unwrap();
+    donor_config.enable_early_data();
+    donor_config.enable_dgram(true, 8, 8);
+    let mut donor = test_utils::Pipe::with_config(&mut donor_config).unwrap();
+    donor.handshake().unwrap();
+    let session = donor.client.session().unwrap().to_vec();
+    let mut server_config = test_utils::Pipe::default_config(cc).unwrap();
+    server_config
+        .set_ticket_key(if rejection == "rotated" {
+            &[0x48; 48]
+        } else {
+            &KEY
+        })
+        .unwrap();
+    if rejection == "hrr" {
+        server_config.enable_early_data();
+        server_config.set_curves_list("P-256").unwrap();
+    }
+    server_config.set_initial_max_streams_bidi(1);
+    server_config.set_initial_max_data(128);
+    server_config.set_initial_max_stream_data_bidi_remote(64);
+    server_config.enable_dgram(true, 8, 8);
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut donor_config,
+        &mut server_config,
+    )
+    .unwrap();
+    pipe.server.defer_early_data_handshake().unwrap();
+    pipe.client.set_session(&session).unwrap();
+    let initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert!(pipe.client.is_in_early_data());
+    pipe.client
+        .stream_send(0, b"discarded early Auth", false)
+        .unwrap();
+    pipe.client
+        .stream_send(4, b"discarded stream", true)
+        .unwrap();
+    pipe.client.dgram_send(b"discarded datagram").unwrap();
+    let early = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let last_early = pipe.client.pkt_num_spaces[packet::Epoch::Application]
+        .largest_tx_pkt_num
+        .unwrap();
+    test_utils::process_flight(&mut pipe.server, initial).unwrap();
+    test_utils::process_flight(&mut pipe.server, early.clone()).unwrap();
+    pipe.advance().unwrap();
+    assert!(pipe.client.is_established() && pipe.server.is_established());
+    assert_eq!(pipe.client.is_resumed(), rejection != "rotated");
+    assert!(!pipe.client.early_data_accepted());
+    assert!(!pipe.server.early_data_handshake_pending());
+    assert_eq!(pipe.client.tx_data, 0);
+    assert_eq!(pipe.client.max_tx_data, 128);
+    assert!(pipe.client.streams.get(0).is_none());
+    assert_eq!(pipe.client.streams.tx_buffered(), 0);
+    assert_eq!(pipe.client.dgram_send_queue_len(), 0);
+    assert_eq!(
+        pipe.client.stream_send(4, b"denied", false),
+        Err(Error::StreamLimit)
+    );
+    assert_eq!(pipe.client.stream_send(0, b"one 1-RTT Auth", false), Ok(14));
+    pipe.advance().unwrap();
+    let mut out = [0; 256];
+    assert_eq!(pipe.server.stream_recv(0, &mut out), Ok((14, false)));
+    assert_eq!(&out[..14], b"one 1-RTT Auth");
+    assert!(
+        pipe.client.pkt_num_spaces[packet::Epoch::Application]
+            .largest_tx_pkt_num
+            .unwrap()
+            > last_early
+    );
+    test_utils::process_flight(&mut pipe.server, early).unwrap();
+    pipe.client.on_timeout();
+    pipe.advance().unwrap();
+    assert_eq!(pipe.server.stream_recv(0, &mut out), Err(Error::Done));
+    assert!(pipe.server.peer_error().is_none());
+}
+
+
+#[rstest]
 fn handshake_alpn_mismatch(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {

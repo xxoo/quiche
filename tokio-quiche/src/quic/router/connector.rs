@@ -60,6 +60,7 @@ pub(crate) struct ClientConnector<Tx> {
     timeout_queue: DelayQueue<ConnectionId<'static>>,
     zero_rtt_dgrams: Vec<Vec<u8>>,
     zero_rtt_streams: Vec<ZeroRttStream>,
+    allow_early_data_fallback: bool,
     terminal_tx: Option<oneshot::Sender<Box<QuicheConnection>>>,
 }
 
@@ -114,6 +115,7 @@ where
     pub(crate) fn new(
         socket_tx: Arc<Tx>, connection: Box<QuicheConnection>,
         zero_rtt_dgrams: Vec<Vec<u8>>, zero_rtt_streams: Vec<ZeroRttStream>,
+        allow_early_data_fallback: bool,
         terminal_tx: oneshot::Sender<Box<QuicheConnection>>,
     ) -> Self {
         Self {
@@ -122,6 +124,7 @@ where
             timeout_queue: Default::default(),
             zero_rtt_dgrams,
             zero_rtt_streams,
+            allow_early_data_fallback,
             terminal_tx: Some(terminal_tx),
         }
     }
@@ -167,6 +170,10 @@ where
         }
 
         if !conn.is_in_early_data() {
+            if self.allow_early_data_fallback {
+                self.zero_rtt_streams.clear();
+                return Ok(());
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "0-RTT STREAMs configured, but early data is unavailable",

@@ -249,6 +249,15 @@ impl<F: BufFactory> StreamMap<F> {
         }
     }
 
+    /// Discards streams and remembered peer limits after rejecting 0-RTT.
+    pub fn discard_early_data(&mut self) {
+        *self = Self::new(
+            self.initial_max_streams_bidi,
+            self.initial_max_streams_uni,
+            self.max_stream_window,
+        );
+    }
+
     /// Returns the stream with the given ID if it exists.
     pub fn get(&self, id: u64) -> Option<&Stream<F>> {
         self.streams.get(&id)

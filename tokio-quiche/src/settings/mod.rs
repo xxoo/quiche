@@ -92,6 +92,11 @@ pub struct ConnectionParams<'a> {
     ///
     /// [`connect_with_config()`]: crate::quic::connect_with_config
     pub zero_rtt_streams: Vec<ZeroRttStream>,
+    /// Continue the same handshake when configured 0-RTT streams cannot be
+    /// sent. Defaults to false. The application must retain its request and
+    /// send it after establishment when `early_data_accepted()` is false.
+    /// Rejected 0-RTT streams are reset by quiche and are not auto-replayed.
+    pub allow_early_data_fallback: bool,
     server_config_identity: ServerConfigIdentity,
     /// Custom destination connection ID to use for client connections.
     ///
@@ -117,6 +122,7 @@ impl<'a> Default for ConnectionParams<'a> {
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
+            allow_early_data_fallback: false,
             server_config_identity: ServerConfigIdentity::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
@@ -160,6 +166,7 @@ impl<'a> ConnectionParams<'a> {
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
+            allow_early_data_fallback: false,
             server_config_identity: ServerConfigIdentity::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
@@ -182,6 +189,7 @@ impl<'a> ConnectionParams<'a> {
             session: None,
             zero_rtt_dgrams: Vec::new(),
             zero_rtt_streams: Vec::new(),
+            allow_early_data_fallback: false,
             server_config_identity: ServerConfigIdentity::new(),
             #[cfg(feature = "custom-client-dcid")]
             dcid: None,
