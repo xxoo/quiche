@@ -1527,6 +1527,9 @@ where
     /// frame.
     peer_error: Option<ConnectionError>,
 
+    /// Packet type carrying the first received CONNECTION_CLOSE frame.
+    peer_error_packet_type: Option<Type>,
+
     /// The connection-level limit at which send blocking occurred.
     blocked_limit: Option<u64>,
 
@@ -2208,6 +2211,8 @@ impl<F: BufFactory> Connection<F> {
             local_error: None,
 
             peer_error: None,
+
+            peer_error_packet_type: None,
 
             blocked_limit: None,
 
@@ -8103,6 +8108,18 @@ impl<F: BufFactory> Connection<F> {
         self.peer_error.as_ref()
     }
 
+    /// Returns the packet type carrying the first error received from the peer.
+    ///
+    /// This distinguishes Initial, Handshake, 0-RTT, and 1-RTT packets without
+    /// inferring the protection level from the connection's current state.
+    /// The packet type alone does not prove that the peer was authenticated.
+    /// Returns `None` until a CONNECTION_CLOSE frame has been received; local
+    /// errors do not set this value.
+    #[inline]
+    pub fn peer_error_packet_type(&self) -> Option<Type> {
+        self.peer_error_packet_type
+    }
+
     /// Returns the error [`close()`] was called with, or internally
     /// created quiche errors, if any.
     ///
@@ -9157,22 +9174,28 @@ impl<F: BufFactory> Connection<F> {
             frame::Frame::ConnectionClose {
                 error_code, reason, ..
             } => {
-                self.peer_error = Some(ConnectionError {
-                    is_app: false,
-                    error_code,
-                    reason,
-                });
+                if self.peer_error.is_none() {
+                    self.peer_error = Some(ConnectionError {
+                        is_app: false,
+                        error_code,
+                        reason,
+                    });
+                    self.peer_error_packet_type = Some(hdr.ty);
+                }
 
                 let path = self.paths.get_active()?;
                 self.draining_timer = Some(now + (path.recovery.pto() * 3));
             },
 
             frame::Frame::ApplicationClose { error_code, reason } => {
-                self.peer_error = Some(ConnectionError {
-                    is_app: true,
-                    error_code,
-                    reason,
-                });
+                if self.peer_error.is_none() {
+                    self.peer_error = Some(ConnectionError {
+                        is_app: true,
+                        error_code,
+                        reason,
+                    });
+                    self.peer_error_packet_type = Some(hdr.ty);
+                }
 
                 let path = self.paths.get_active()?;
                 self.draining_timer = Some(now + (path.recovery.pto() * 3));

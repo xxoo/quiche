@@ -924,6 +924,10 @@ fn early_data_handshake_gate_requires_application_acceptance() {
             assert!(!error.is_app);
             assert_eq!(error.error_code, 0x0c);
             assert!(error.reason.is_empty());
+            assert_eq!(
+                pipe.client.peer_error_packet_type(),
+                Some(Type::Handshake)
+            );
         }
     }
 }
@@ -10558,12 +10562,102 @@ fn transport_close_by_client_during_handshake_established(
 }
 
 #[rstest]
+fn peer_error_packet_type_during_handshake(
+    #[values(Type::Initial, Type::Handshake)] pkt_type: Type,
+) {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    assert_eq!(pipe.client.peer_error_packet_type(), None);
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    if pkt_type == Type::Handshake {
+        let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+        test_utils::process_flight(&mut pipe.client, flight).unwrap();
+        assert!(!pipe.client.handshake_confirmed);
+    }
+
+    let first = frame::Frame::ConnectionClose {
+        error_code: 42,
+        frame_type: 0,
+        reason: b"first close".to_vec(),
+    };
+    let later = frame::Frame::ConnectionClose {
+        error_code: 43,
+        frame_type: 0,
+        reason: b"later close".to_vec(),
+    };
+    let mut buf = [0; 65535];
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        pkt_type,
+        &[first, later.clone()],
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+    assert_eq!(pipe.client.peer_error_packet_type(), Some(pkt_type));
+    assert_eq!(pipe.client.peer_error().unwrap().error_code, 42);
+
+    // A later packet at a different protection level cannot replace the
+    // original close's source or error details while the receiver drains.
+    let later_type = if pkt_type == Type::Initial {
+        Type::Handshake
+    } else {
+        Type::Short
+    };
+    let len =
+        test_utils::encode_pkt(&mut pipe.server, later_type, &[later], &mut buf)
+            .unwrap();
+    assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+    assert_eq!(pipe.client.peer_error_packet_type(), Some(pkt_type));
+    assert_eq!(pipe.client.peer_error().unwrap().error_code, 42);
+}
+
+#[test]
+fn peer_error_packet_type_zero_rtt() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_early_data();
+    config.set_ticket_key(&[0x5a; 48]).unwrap();
+    let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
+    donor.handshake().unwrap();
+    let session = donor.client.session().unwrap().to_vec();
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.client.set_session(&session).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert!(pipe.client.is_in_early_data());
+
+    // Application close is permitted in 0-RTT. Its packet type must not be
+    // confused with 1-RTT, which shares the same packet-number epoch.
+    let mut buf = [0; 65535];
+    let len = test_utils::encode_pkt(
+        &mut pipe.client,
+        Type::ZeroRTT,
+        &[frame::Frame::ApplicationClose {
+            error_code: 42,
+            reason: b"early close".to_vec(),
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+    assert_eq!(pipe.server.peer_error_packet_type(), Some(Type::ZeroRTT));
+    assert!(pipe.server.peer_error().unwrap().is_app);
+    assert_eq!(pipe.server.peer_error().unwrap().error_code, 42);
+    assert_eq!(pipe.client.peer_error_packet_type(), None);
+}
+
+#[rstest]
 fn peer_error(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
 
     assert_eq!(pipe.server.close(false, 0x1234, b"hello?"), Ok(()));
     assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.client.peer_error_packet_type(), Some(Type::Short));
+    assert_eq!(pipe.server.peer_error_packet_type(), None);
 
     assert_eq!(
         pipe.client.peer_error(),
@@ -10584,6 +10678,8 @@ fn app_peer_error(
 
     assert_eq!(pipe.server.close(true, 0x1234, b"hello!"), Ok(()));
     assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.client.peer_error_packet_type(), Some(Type::Short));
+    assert_eq!(pipe.server.peer_error_packet_type(), None);
 
     assert_eq!(
         pipe.client.peer_error(),
@@ -10603,6 +10699,8 @@ fn local_error(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     assert_eq!(pipe.server.local_error(), None);
 
     assert_eq!(pipe.server.close(true, 0x1234, b"hello!"), Ok(()));
+    assert_eq!(pipe.server.peer_error(), None);
+    assert_eq!(pipe.server.peer_error_packet_type(), None);
 
     assert_eq!(
         pipe.server.local_error(),
