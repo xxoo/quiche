@@ -1051,6 +1051,11 @@ pub trait ApplicationOverQuic: Send + 'static {
     /// `connection_result` is [`Ok`] only if the connection was closed without
     /// any local error. Otherwise, the state of `qconn` depends on the
     /// error type and application behavior.
+    ///
+    /// If the client connector detects a terminal connection before handing it
+    /// to an I/O worker, the connect future invokes this callback before
+    /// returning the error, provided `should_act()` returns `true`. This keeps
+    /// terminal connection metadata available to the application.
     fn on_conn_close<M: Metrics>(
         &mut self, qconn: &mut QuicheConnection, metrics: &M,
         connection_result: &QuicResult<()>,

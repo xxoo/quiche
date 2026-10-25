@@ -107,6 +107,7 @@ use crate::QuicResult;
 use crate::QuicResultExt;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 mod addr_validation_token;
 pub(crate) mod connection;
@@ -275,7 +276,7 @@ struct ClientMigrationSetup {
 
 async fn connect_with_config_inner<Tx, Rx, App>(
     socket: Socket<Tx, Rx>, host: Option<&str>, params: &ConnectionParams<'_>,
-    app: App, client_migration: Option<ClientMigrationSetup>,
+    mut app: App, client_migration: Option<ClientMigrationSetup>,
 ) -> QuicResult<QuicConnection>
 where
     Tx: DatagramSocketSend + Send + Sync + 'static,
@@ -373,6 +374,7 @@ where
 
     let socket_tx = Arc::new(socket.send);
     let socket_rx = socket.recv;
+    let (terminal_tx, mut terminal_rx) = oneshot::channel();
 
     let (router, mut quic_connection_stream) =
         if let Some(client_migration) = client_migration {
@@ -390,6 +392,7 @@ where
                     Box::new(quiche_conn),
                     params.zero_rtt_dgrams.clone(),
                     params.zero_rtt_streams.clone(),
+                    terminal_tx,
                 ),
                 DefaultMetrics,
             )
@@ -404,6 +407,7 @@ where
                     Box::new(quiche_conn),
                     params.zero_rtt_dgrams.clone(),
                     params.zero_rtt_streams.clone(),
+                    terminal_tx,
                 ),
                 DefaultMetrics,
             )
@@ -421,11 +425,25 @@ where
         }
     });
 
-    Ok(quic_connection_stream
+    let connection = quic_connection_stream
         .recv()
         .await
-        .ok_or("unable to establish connection")??
-        .start(app))
+        .ok_or("unable to establish connection")?;
+    match connection {
+        Ok(connection) => Ok(connection.start(app)),
+        Err(error) => {
+            let close_result: QuicResult<()> = Err(error.into());
+            // ClientConnector publishes the terminal connection before its
+            // error reaches this stream, so no wait or worker handoff is
+            // needed to expose peer-close metadata to the application.
+            if let Ok(mut qconn) = terminal_rx.try_recv() {
+                if app.should_act() {
+                    app.on_conn_close(&mut qconn, &DefaultMetrics, &close_result);
+                }
+            }
+            Err(close_result.unwrap_err())
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

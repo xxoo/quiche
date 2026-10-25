@@ -39,11 +39,13 @@ use datagram_socket::MAX_DATAGRAM_SIZE;
 use foundations::telemetry::log;
 use quiche::ConnectionId;
 use quiche::Header;
+use tokio::sync::oneshot;
 use tokio_util::time::delay_queue::Key;
 use tokio_util::time::DelayQueue;
 
 use crate::quic::router::InitialPacketHandler;
 use crate::quic::router::NewConnection;
+use crate::quic::HandshakeError;
 use crate::quic::Incoming;
 use crate::quic::QuicheConnection;
 use crate::settings::ConnectionParams;
@@ -58,6 +60,7 @@ pub(crate) struct ClientConnector<Tx> {
     timeout_queue: DelayQueue<ConnectionId<'static>>,
     zero_rtt_dgrams: Vec<Vec<u8>>,
     zero_rtt_streams: Vec<ZeroRttStream>,
+    terminal_tx: Option<oneshot::Sender<Box<QuicheConnection>>>,
 }
 
 /// State the connecting connection is in.
@@ -111,6 +114,7 @@ where
     pub(crate) fn new(
         socket_tx: Arc<Tx>, connection: Box<QuicheConnection>,
         zero_rtt_dgrams: Vec<Vec<u8>>, zero_rtt_streams: Vec<ZeroRttStream>,
+        terminal_tx: oneshot::Sender<Box<QuicheConnection>>,
     ) -> Self {
         Self {
             socket_tx: MaybeConnectedSocket::new(socket_tx),
@@ -118,7 +122,20 @@ where
             timeout_queue: Default::default(),
             zero_rtt_dgrams,
             zero_rtt_streams,
+            terminal_tx: Some(terminal_tx),
         }
+    }
+
+    fn fail(
+        &mut self, conn: Box<QuicheConnection>, error: io::Error,
+    ) -> io::Error {
+        // Publish the connection before the router reports the error. The
+        // connect future still owns the application and must run its close
+        // callback with the terminal metadata before returning that error.
+        if let Some(tx) = self.terminal_tx.take() {
+            let _ = tx.send(conn);
+        }
+        error
     }
 
     fn queue_zero_rtt_dgrams(
@@ -186,10 +203,17 @@ where
     fn set_connection_to_pending(
         &mut self, mut conn: Box<QuicheConnection>,
     ) -> io::Result<()> {
-        let mut packets = drain_conn_send(&mut conn)?;
-        self.queue_zero_rtt_dgrams(&mut conn)?;
-        self.queue_zero_rtt_streams(&mut conn)?;
-        packets.extend(drain_conn_send(&mut conn)?);
+        let packets = (|| {
+            let mut packets = drain_conn_send(&mut conn)?;
+            self.queue_zero_rtt_dgrams(&mut conn)?;
+            self.queue_zero_rtt_streams(&mut conn)?;
+            packets.extend(drain_conn_send(&mut conn)?);
+            Ok(packets)
+        })();
+        let packets = match packets {
+            Ok(packets) => packets,
+            Err(error) => return Err(self.fail(conn, error)),
+        };
         // Send Initial and 0-RTT packets from one task so early-data packets
         // cannot race ahead of the Initial that creates the server route.
         spawn_packet_send(
@@ -251,7 +275,10 @@ where
         }
 
         let scid = conn.source_id();
-        if conn.is_established() {
+        if conn.is_closed() || conn.is_draining() {
+            log::error!("QUIC connection closed on_incoming"; "scid" => ?scid);
+            Err(self.fail(conn, HandshakeError::ConnectionClosed.into()))
+        } else if conn.is_established() {
             log::debug!("QUIC connection established"; "scid" => ?scid);
 
             Ok(Some(NewConnection {
@@ -265,14 +292,6 @@ where
                 fixed_peer_ip: None,
                 server_initial_metadata: None,
             }))
-        } else if conn.is_closed() {
-            let scid = conn.source_id();
-            log::error!("QUIC connection closed on_incoming"; "scid" => ?scid);
-
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("connection {scid:?} timed out"),
-            ))
         } else {
             self.set_connection_to_pending(conn).map(|()| None)
         }
@@ -296,10 +315,11 @@ where
         if pending.conn.is_closed() {
             log::error!("pending connection closed on_timeout"; "scid" => ?scid);
 
-            return Err(io::Error::new(
+            let error = io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("connection {scid:?} timed out"),
-            ));
+            );
+            return Err(self.fail(pending.conn, error));
         }
 
         self.set_connection_to_pending(pending.conn)

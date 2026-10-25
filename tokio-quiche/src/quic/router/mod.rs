@@ -1064,6 +1064,7 @@ mod tests {
     );
 
     type StreamEvent = (bool, u64, Vec<u8>, bool);
+    type CloseEvent = (bool, Option<quiche::Type>, Option<u64>, bool);
 
     struct TestApp {
         session_tx: Option<oneshot::Sender<Option<Vec<u8>>>>,
@@ -1071,6 +1072,7 @@ mod tests {
         stream_tx: Option<oneshot::Sender<StreamEvent>>,
         stream_response: Option<Vec<u8>>,
         close_on_stream: bool,
+        close_tx: Option<oneshot::Sender<CloseEvent>>,
         buf: Vec<u8>,
     }
 
@@ -1085,6 +1087,7 @@ mod tests {
                 stream_tx: None,
                 stream_response: None,
                 close_on_stream: false,
+                close_tx: None,
                 buf: vec![0; MAX_DATAGRAM_SIZE],
             }
         }
@@ -1099,6 +1102,7 @@ mod tests {
                 stream_tx: Some(stream_tx),
                 stream_response,
                 close_on_stream,
+                close_tx: None,
                 buf: vec![0; MAX_DATAGRAM_SIZE],
             }
         }
@@ -1219,6 +1223,20 @@ mod tests {
         ) -> QuicResult<()> {
             self.maybe_send_session(qconn);
             Ok(())
+        }
+
+        fn on_conn_close<M: Metrics>(
+            &mut self, qconn: &mut QuicheConnection, _metrics: &M,
+            connection_result: &QuicResult<()>,
+        ) {
+            if let Some(tx) = self.close_tx.take() {
+                let _ = tx.send((
+                    qconn.is_established(),
+                    qconn.peer_error_packet_type(),
+                    qconn.peer_error().map(|error| error.error_code),
+                    connection_result.is_err(),
+                ));
+            }
         }
     }
 
@@ -2007,6 +2025,89 @@ mod tests {
         assert!(client_fin);
 
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn early_peer_close_is_published_before_connect_returns_error() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let server_params = ConnectionParams::new_server(
+            test_quic_settings(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        let mut streams =
+            crate::listen([server_socket], server_params, DefaultMetrics)
+                .unwrap();
+        let mut incoming = streams.pop().unwrap();
+        let (stream_tx, stream_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            incoming
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .start(TestApp::new(None, None));
+            let mut connection = incoming.next().await.unwrap().unwrap();
+            connection.defer_early_data_handshake().unwrap();
+            connection.start(TestApp::new_stream(stream_tx, None, true));
+        });
+
+        let (session_tx, session_rx) = oneshot::channel();
+        let mut client_params = ConnectionParams::new_client(
+            test_quic_settings(),
+            None,
+            Hooks::default(),
+        );
+        let _first = connect_test_client(
+            server_addr,
+            &client_params,
+            TestApp::new(Some(session_tx), None),
+        )
+        .await
+        .unwrap();
+        client_params.session = Some(
+            time::timeout(Duration::from_secs(5), session_rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        client_params.zero_rtt_streams = vec![ZeroRttStream {
+            data: b"rejected early auth".to_vec(),
+            fin: true,
+        }];
+        let (close_tx, mut close_rx) = oneshot::channel();
+        let mut client_app = TestApp::new(None, None);
+        client_app.close_tx = Some(close_tx);
+        let result = time::timeout(
+            Duration::from_secs(5),
+            connect_test_client(server_addr, &client_params, client_app),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+
+        // No await: the callback must already have completed when connect
+        // returns its error, even though no client I/O worker was started.
+        let (established, packet_type, error_code, failed) =
+            close_rx.try_recv().unwrap();
+        assert!(!established);
+        assert!(matches!(
+            packet_type,
+            Some(quiche::Type::Initial | quiche::Type::Handshake)
+        ));
+        assert_eq!(error_code, Some(quiche::WireErrorCode::NoError as u64));
+        assert!(failed);
+        let (early, _, payload, _) = stream_rx.await.unwrap();
+        assert!(early);
+        assert_eq!(payload, b"rejected early auth");
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
