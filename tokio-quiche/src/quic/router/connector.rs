@@ -30,6 +30,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use std::time::Instant;
 
 use datagram_socket::DatagramSocketSend;
@@ -43,6 +44,7 @@ use tokio::sync::oneshot;
 use tokio_util::time::delay_queue::Key;
 use tokio_util::time::DelayQueue;
 
+use crate::quic::connection::HandshakeInfo;
 use crate::quic::router::InitialPacketHandler;
 use crate::quic::router::NewConnection;
 use crate::quic::HandshakeError;
@@ -62,6 +64,7 @@ pub(crate) struct ClientConnector<Tx> {
     zero_rtt_streams: Vec<ZeroRttStream>,
     allow_early_data_fallback: bool,
     terminal_tx: Option<oneshot::Sender<Box<QuicheConnection>>>,
+    handshake_info: HandshakeInfo,
 }
 
 /// State the connecting connection is in.
@@ -105,7 +108,6 @@ impl ConnectionState {
 struct PendingConnection {
     conn: Box<QuicheConnection>,
     timeout_key: Option<Key>,
-    handshake_start_time: Instant,
 }
 
 impl<Tx> ClientConnector<Tx>
@@ -115,7 +117,7 @@ where
     pub(crate) fn new(
         socket_tx: Arc<Tx>, connection: Box<QuicheConnection>,
         zero_rtt_dgrams: Vec<Vec<u8>>, zero_rtt_streams: Vec<ZeroRttStream>,
-        allow_early_data_fallback: bool,
+        allow_early_data_fallback: bool, handshake_timeout: Option<Duration>,
         terminal_tx: oneshot::Sender<Box<QuicheConnection>>,
     ) -> Self {
         Self {
@@ -126,6 +128,7 @@ where
             zero_rtt_streams,
             allow_early_data_fallback,
             terminal_tx: Some(terminal_tx),
+            handshake_info: HandshakeInfo::new(Instant::now(), handshake_timeout),
         }
     }
 
@@ -210,6 +213,17 @@ where
     fn set_connection_to_pending(
         &mut self, mut conn: Box<QuicheConnection>,
     ) -> io::Result<()> {
+        if self.handshake_info.is_expired() {
+            let _ = conn.close(
+                false,
+                quiche::WireErrorCode::ApplicationError as u64,
+                &[],
+            );
+            return Err(self.fail(
+                conn,
+                io::Error::new(io::ErrorKind::TimedOut, HandshakeError::Timeout),
+            ));
+        }
         let packets = (|| {
             let mut packets = drain_conn_send(&mut conn)?;
             self.queue_zero_rtt_dgrams(&mut conn)?;
@@ -229,16 +243,20 @@ where
             packets,
         );
 
-        let timeout_key = conn.timeout_instant().map(|instant| {
+        // Use the original handshake deadline even when discarded packets,
+        // Retry, or PTO cause this pending state to be rebuilt.
+        let deadline = conn
+            .timeout_instant()
+            .into_iter()
+            .chain(self.handshake_info.deadline())
+            .min();
+        let timeout_key = deadline.map(|instant| {
             self.timeout_queue
                 .insert_at(conn.source_id().into_owned(), instant.into())
         });
 
-        self.connection = ConnectionState::Pending(PendingConnection {
-            conn,
-            timeout_key,
-            handshake_start_time: Instant::now(),
-        });
+        self.connection =
+            ConnectionState::Pending(PendingConnection { conn, timeout_key });
 
         Ok(())
     }
@@ -253,12 +271,18 @@ where
         let Some(PendingConnection {
             mut conn,
             timeout_key,
-            handshake_start_time,
         }) = self.connection.take_if_pending_and_id_matches(&hdr.dcid)
         else {
             log::debug!("Received Initial packet for unknown connection ID"; "scid" => ?hdr.dcid);
             return Ok(None);
         };
+
+        if self.handshake_info.is_expired() {
+            if let Some(key) = timeout_key {
+                self.timeout_queue.remove(&key);
+            }
+            return self.set_connection_to_pending(conn).map(|()| None);
+        }
 
         let recv_info = quiche::RecvInfo {
             from: incoming.peer_addr,
@@ -295,7 +319,7 @@ where
                 initial_pkt: None,
                 enable_per_connection_dscp: false,
                 cid_generator: None,
-                handshake_start_time,
+                handshake_start_time: self.handshake_info.start_time(),
                 fixed_peer_ip: None,
                 server_initial_metadata: None,
             }))

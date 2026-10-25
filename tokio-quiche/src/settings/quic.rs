@@ -70,6 +70,13 @@ pub struct QuicSettings {
     /// Defaults to `false`.
     pub enable_early_data: bool,
 
+    /// Ignores and suppresses CONNECTION_CLOSE in Initial packets only.
+    ///
+    /// Handshake and 1-RTT closes retain their normal behavior. Local failures
+    /// terminate silently if no protected close can be sent. This opt-in
+    /// extension defaults to false and is fixed at connection creation.
+    pub disable_initial_close: bool,
+
     /// Sets the `initial_max_data` transport parameter.
     ///
     /// Defaults to 10 MB.

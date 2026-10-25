@@ -189,6 +189,21 @@ impl Frame {
     pub fn from_bytes(
         b: &mut octets::Octets, pkt: packet::Type,
     ) -> Result<Frame> {
+        Self::from_bytes_with_close_policy(b, pkt, false)
+    }
+
+    // The caller discards either CLOSE encoding before applying any frame
+    // effects. In particular, an Initial application CLOSE must not turn into
+    // a fatal InvalidPacket before the opt-in filter can ignore it.
+    pub(crate) fn from_initial_bytes_allowing_close(
+        b: &mut octets::Octets,
+    ) -> Result<Frame> {
+        Self::from_bytes_with_close_policy(b, packet::Type::Initial, true)
+    }
+
+    fn from_bytes_with_close_policy(
+        b: &mut octets::Octets, pkt: packet::Type, ignore_initial_close: bool,
+    ) -> Result<Frame> {
         let frame_type = b.get_varint()?;
 
         let frame = match frame_type {
@@ -352,6 +367,9 @@ impl Frame {
             (_, Frame::ACK { .. }) => true,
             (_, Frame::Crypto { .. }) => true,
             (_, Frame::ConnectionClose { .. }) => true,
+
+            (packet::Type::Initial, Frame::ApplicationClose { .. }) =>
+                ignore_initial_close,
 
             // All frames are allowed on 0-RTT and 1-RTT packets.
             (packet::Type::Short, _) => true,

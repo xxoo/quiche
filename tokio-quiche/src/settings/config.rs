@@ -257,6 +257,7 @@ fn make_quiche_config_with_settings(
 fn apply_transport_settings(
     mut config: quiche::Config, quic_settings: &QuicSettings,
 ) -> QuicResult<quiche::Config> {
+    config.set_disable_initial_close(quic_settings.disable_initial_close);
     if let Some(timeout) = quic_settings.max_idle_timeout {
         let ms = timeout
             .as_millis()
@@ -586,6 +587,52 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../quiche/examples/cert.key");
     const WRONG_CERT_FILE: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../apps/src/bin/cert.crt");
+
+    #[test]
+    fn initial_close_policy_is_selected_and_frozen_per_profile() {
+        for base in [false, true] {
+            for selected in [None, Some(false), Some(true)] {
+                let mut params = ConnectionParams::default();
+                params.settings.disable_initial_close = base;
+                params.server_config_profiles.push(ServerConfigOverrides {
+                    disable_initial_close: selected,
+                    share_tls_context_with_default: true,
+                    ..Default::default()
+                });
+                let mut config =
+                    Config::new(&params, SocketCapabilities::default()).unwrap();
+                for index in [None, Some(0)] {
+                    let expected = if index.is_none() {
+                        base
+                    } else {
+                        selected.unwrap_or(base)
+                    };
+                    let mut profile =
+                        config.server_profile_config_mut(index).unwrap();
+                    let mut pipe = quiche::test_utils::Pipe::with_server_config(
+                        profile.quiche_config_mut(),
+                    )
+                    .unwrap();
+                    profile
+                        .quiche_config_mut()
+                        .set_disable_initial_close(!expected);
+                    let mut flight =
+                        quiche::test_utils::emit_flight(&mut pipe.client)
+                            .unwrap();
+                    let hdr =
+                        quiche::Header::from_slice(&mut flight[0].0, 16).unwrap();
+                    let mut buf = [0; 4096];
+                    let len = quiche::test_utils::forge_initial_close(
+                        &hdr, false, false, &mut buf,
+                    )
+                    .unwrap();
+                    pipe.server_recv(&mut buf[..len]).unwrap();
+                    assert_eq!(pipe.server.peer_error().is_none(), expected);
+                    assert_eq!(pipe.server.is_draining(), !expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn server_config_profiles_apply_overrides() {

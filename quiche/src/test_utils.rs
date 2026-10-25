@@ -584,6 +584,78 @@ pub fn encode_pkt<F: BufFactory>(
     Ok(written)
 }
 
+/// Encodes a forged Initial CLOSE using only the observed client's Initial
+/// header. Uses an unrelated server CID, a high packet number and padding to
+/// exercise receiver state poisoning without any TLS identity or secrets.
+pub fn forge_initial_close(
+    client_initial: &Header, is_server: bool, application: bool, buf: &mut [u8],
+) -> Result<usize> {
+    let mut hdr = client_initial.clone();
+    hdr.ty = Type::Initial;
+    hdr.pkt_num = 1000;
+    hdr.pkt_num_len = 4;
+    hdr.token = None;
+    if is_server {
+        hdr.dcid = client_initial.scid.clone();
+        hdr.scid = ConnectionId::from_ref(&[0xa5; 16]);
+    }
+    let close = if application {
+        frame::Frame::ApplicationClose {
+            error_code: 42,
+            reason: b"forged application close".to_vec(),
+        }
+    } else {
+        frame::Frame::ConnectionClose {
+            error_code: 42,
+            frame_type: 0,
+            reason: b"forged transport close".to_vec(),
+        }
+    };
+    encode_initial_packet(
+        &hdr,
+        &client_initial.dcid,
+        is_server,
+        &[close, frame::Frame::Padding { len: 1200 }],
+        buf,
+    )
+}
+
+/// Encodes an Initial packet using only public connection IDs and QUIC keys.
+/// The header must use a four-byte packet number. No TLS identity or session
+/// secrets are used, so this can model an on-path forged Initial packet.
+pub(crate) fn encode_initial_packet(
+    hdr: &Header, secret_dcid: &[u8], is_server: bool, frames: &[frame::Frame],
+    buf: &mut [u8],
+) -> Result<usize> {
+    if hdr.ty != Type::Initial || hdr.pkt_num_len != 4 {
+        return Err(Error::InvalidPacket);
+    }
+    let (_, mut seal) = crypto::derive_initial_key_material(
+        secret_dcid,
+        hdr.version,
+        is_server,
+        false,
+    )?;
+    let mut b = octets::OctetsMut::with_slice(buf);
+    hdr.to_bytes(&mut b)?;
+    let payload_len = frames.iter().map(frame::Frame::wire_len).sum::<usize>();
+    b.put_varint((4 + payload_len + seal.alg().tag_len()) as u64)?;
+    b.put_u32(hdr.pkt_num as u32)?;
+    let payload_offset = b.off();
+    for frame in frames {
+        frame.to_bytes(&mut b)?;
+    }
+    packet::encrypt_pkt(
+        &mut b,
+        hdr.pkt_num,
+        4,
+        payload_len,
+        payload_offset,
+        None,
+        &mut seal,
+    )
+}
+
 pub fn decode_pkt<F: BufFactory>(
     conn: &mut Connection<F>, buf: &mut [u8],
 ) -> Result<Vec<frame::Frame>> {
@@ -595,7 +667,11 @@ pub fn decode_pkt<F: BufFactory>(
 
     let aead = conn.crypto_ctx[epoch].crypto_open.as_ref().unwrap();
 
-    let payload_len = b.cap();
+    let payload_len = if hdr.ty == Type::Short {
+        b.cap()
+    } else {
+        b.get_varint()? as usize
+    };
 
     packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
 

@@ -611,6 +611,8 @@ pub struct Config {
 
     disable_dcid_reuse: bool,
 
+    disable_initial_close: bool,
+
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
@@ -705,9 +707,23 @@ impl Config {
 
             disable_dcid_reuse: false,
 
+            disable_initial_close: false,
+
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
         })
+    }
+
+    /// Ignores received CONNECTION_CLOSE frames in Initial packets and never
+    /// sends CONNECTION_CLOSE in Initial packets when enabled.
+    ///
+    /// Initial protection keys are public. Handshake and 1-RTT closes retain
+    /// their normal behavior. If a local error has no protected close keys,
+    /// the connection terminates silently while retaining the local error.
+    /// This optional extension defaults to false and is fixed when a
+    /// connection is created. It is not negotiated with the peer.
+    pub fn set_disable_initial_close(&mut self, enabled: bool) {
+        self.disable_initial_close = enabled;
     }
 
     /// Configures the given certificate chain.
@@ -1530,6 +1546,9 @@ where
     /// Packet type carrying the first received CONNECTION_CLOSE frame.
     peer_error_packet_type: Option<Type>,
 
+    /// Fixed policy for publicly forgeable Initial CONNECTION_CLOSE frames.
+    disable_initial_close: bool,
+
     /// The connection-level limit at which send blocking occurred.
     blocked_limit: Option<u64>,
 
@@ -2213,6 +2232,8 @@ impl<F: BufFactory> Connection<F> {
             peer_error: None,
 
             peer_error_packet_type: None,
+
+            disable_initial_close: config.disable_initial_close,
 
             blocked_limit: None,
 
@@ -3320,6 +3341,11 @@ impl<F: BufFactory> Connection<F> {
             Some(v) => v,
 
             None => {
+                if self.disable_initial_close && hdr.ty == Type::Initial {
+                    // Initial keys may already be discarded. Skip exactly
+                    // this packet, not a coalesced protected packet after it.
+                    return Ok(b.off() + payload_len);
+                }
                 if hdr.ty == Type::ZeroRTT &&
                     self.undecryptable_pkts.len() < MAX_UNDECRYPTABLE_PACKETS &&
                     !self.is_established()
@@ -3430,6 +3456,30 @@ impl<F: BufFactory> Connection<F> {
         // Packets with no frames are invalid.
         if payload.cap() == 0 {
             return Err(Error::InvalidPacket);
+        }
+
+        if self.disable_initial_close && hdr.ty == Type::Initial {
+            // A close-only forgery must not adopt the attacker's SCID, consume
+            // packet numbers, refresh timers, or make a later Retry ineligible.
+            // Keep other frames (including PING/ACK/CRYPTO) fully effective.
+            let mut scan = octets::Octets::with_slice(payload.as_ref());
+            let mut saw_close = false;
+            let mut only_close_and_padding = true;
+            while scan.cap() > 0 {
+                match frame::Frame::from_initial_bytes_allowing_close(&mut scan)?
+                {
+                    frame::Frame::ConnectionClose { .. } |
+                    frame::Frame::ApplicationClose { .. } => saw_close = true,
+                    frame::Frame::Padding { .. } => (),
+                    _ => {
+                        only_close_and_padding = false;
+                        break;
+                    },
+                }
+            }
+            if saw_close && only_close_and_padding {
+                return Ok(b.off() + aead_tag_len);
+            }
         }
 
         // Now that we decrypted the packet, let's see if we can map it to an
@@ -3544,11 +3594,29 @@ impl<F: BufFactory> Connection<F> {
 
         // Process packet payload.
         while payload.cap() > 0 {
-            let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
+            let frame = if self.disable_initial_close && hdr.ty == Type::Initial {
+                frame::Frame::from_initial_bytes_allowing_close(&mut payload)?
+            } else {
+                frame::Frame::from_bytes(&mut payload, hdr.ty)?
+            };
 
             qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
                 qlog_frames.push(frame.to_qlog());
             });
+
+            // Filter by the actual packet protection level before publishing
+            // peer_error or entering draining. Continue parsing this packet
+            // and the remainder of its coalesced UDP datagram normally.
+            if self.disable_initial_close &&
+                hdr.ty == Type::Initial &&
+                matches!(
+                    frame,
+                    frame::Frame::ConnectionClose { .. } |
+                        frame::Frame::ApplicationClose { .. }
+                )
+            {
+                continue;
+            }
 
             if frame.ack_eliciting() {
                 ack_elicited = true;
@@ -4010,6 +4078,8 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::BufferTooShort);
         }
 
+        // TLS alerts can set local_error directly, without calling close().
+        self.close_if_initial_only();
         if self.is_closed() || self.is_draining() {
             return Err(Error::Done);
         }
@@ -4216,6 +4286,16 @@ impl<F: BufFactory> Connection<F> {
         now: Instant, pkt_type: Type, bypass_cwnd: bool,
     ) -> Result<(Type, usize)> {
         let is_closing = self.local_error.is_some();
+
+        // A protected close may require the peer to first receive ServerHello.
+        // Only Initial CRYPTO is allowed while closing; never send the final
+        // handshake flight just to expose an application error.
+        let closing_initial_crypto = self.disable_initial_close &&
+            is_closing &&
+            pkt_type == Type::Initial &&
+            self.crypto_ctx[packet::Epoch::Handshake]
+                .crypto_seal
+                .is_some();
 
         // Initial ACKs/ServerHello remain sendable while the application reads
         // 0-RTT. Withhold the server Finished and all 1-RTT packets until the
@@ -5111,7 +5191,9 @@ impl<F: BufFactory> Connection<F> {
 
         // Create CONNECTION_CLOSE frame. Try to send this only on the active
         // path, unless it is the last one available.
-        if path.active() || n_paths == 1 {
+        if (path.active() || n_paths == 1) &&
+            !(self.disable_initial_close && pkt_type == Type::Initial)
+        {
             if let Some(conn_err) = self.local_error.as_ref() {
                 if conn_err.is_app {
                     // Create ApplicationClose frame.
@@ -5151,7 +5233,7 @@ impl<F: BufFactory> Connection<F> {
         // Create CRYPTO frame.
         if crypto_ctx.crypto_stream.is_flushable() &&
             left > frame::MAX_CRYPTO_OVERHEAD &&
-            !is_closing &&
+            (!is_closing || closing_initial_crypto) &&
             path.active()
         {
             let crypto_off = crypto_ctx.crypto_stream.send.off_front();
@@ -7772,6 +7854,7 @@ impl<F: BufFactory> Connection<F> {
         }
 
         if self.local_error.is_some() {
+            self.close_if_initial_only();
             return Err(Error::Done);
         }
 
@@ -7797,9 +7880,26 @@ impl<F: BufFactory> Connection<F> {
         // Close immediately if no packet was processed successfully.
         if self.recv_count == 0 {
             self.mark_closed();
+        } else {
+            self.close_if_initial_only();
         }
 
         Ok(())
+    }
+
+    fn close_if_initial_only(&mut self) {
+        if self.disable_initial_close &&
+            self.local_error.as_ref().is_some_and(|error| !error.is_app) &&
+            self.crypto_ctx[packet::Epoch::Handshake]
+                .crypto_seal
+                .is_none() &&
+            (!self.is_established() ||
+                self.crypto_ctx[packet::Epoch::Application]
+                    .crypto_seal
+                    .is_none())
+        {
+            self.mark_closed();
+        }
     }
 
     /// Returns a string uniquely representing the connection.
@@ -8512,6 +8612,17 @@ impl<F: BufFactory> Connection<F> {
             .as_ref()
             .is_some_and(|conn_err| !conn_err.is_app)
         {
+            if self.disable_initial_close &&
+                self.crypto_ctx[packet::Epoch::Handshake]
+                    .crypto_seal
+                    .is_some() &&
+                self.crypto_ctx[packet::Epoch::Initial]
+                    .crypto_stream
+                    .is_flushable()
+            {
+                return Ok(Type::Initial);
+            }
+
             let epoch = match self.handshake.write_level() {
                 crypto::Level::Initial => packet::Epoch::Initial,
                 crypto::Level::ZeroRTT => unreachable!(),
@@ -8528,7 +8639,9 @@ impl<F: BufFactory> Connection<F> {
                     // Downgrade the epoch to Initial as the remote peer might
                     // not be able to decrypt handshake packets yet.
                     packet::Epoch::Handshake
-                        if self.crypto_ctx[packet::Epoch::Initial].has_keys() =>
+                        if !self.disable_initial_close &&
+                            self.crypto_ctx[packet::Epoch::Initial]
+                                .has_keys() =>
                         return Ok(Type::Initial),
 
                     _ => (),

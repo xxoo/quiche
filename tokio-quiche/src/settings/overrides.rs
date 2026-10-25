@@ -73,6 +73,9 @@ pub struct ServerConfigOverrides<'a> {
     /// Overrides whether early data is enabled.
     pub enable_early_data: Option<bool>,
 
+    /// Overrides the fixed Initial CONNECTION_CLOSE receive/send policy.
+    pub disable_initial_close: Option<bool>,
+
     /// Overrides the `initial_max_data` transport parameter.
     pub initial_max_data: Option<u64>,
 
@@ -166,6 +169,10 @@ impl<'a> ServerConfigOverrides<'a> {
             &self.dgram_send_max_queue_len,
         );
         apply_override(&mut settings.enable_early_data, &self.enable_early_data);
+        apply_override(
+            &mut settings.disable_initial_close,
+            &self.disable_initial_close,
+        );
         apply_override(&mut settings.initial_max_data, &self.initial_max_data);
         apply_override(
             &mut settings.initial_max_stream_data_bidi_local,

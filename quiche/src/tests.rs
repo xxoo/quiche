@@ -850,9 +850,12 @@ fn handshake_resumption(
     assert!(pipe.server.is_resumed());
 }
 
-#[test]
-fn early_data_handshake_gate_requires_application_acceptance() {
+#[rstest]
+fn early_data_handshake_gate_requires_application_acceptance(
+    #[values(false, true)] disable_initial_close: bool,
+) {
     let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_disable_initial_close(disable_initial_close);
     config.enable_early_data();
     config.set_ticket_key(&[0x5a; 48]).unwrap();
     let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
@@ -1051,8 +1054,8 @@ fn rejected_early_data_discards_streams_without_reopening_connection(
     assert!(
         pipe.client.pkt_num_spaces[packet::Epoch::Application]
             .largest_tx_pkt_num
-            .unwrap()
-            > last_early
+            .unwrap() >
+            last_early
     );
     test_utils::process_flight(&mut pipe.server, early).unwrap();
     pipe.client.on_timeout();
@@ -1060,7 +1063,6 @@ fn rejected_early_data_discards_streams_without_reopening_connection(
     assert_eq!(pipe.server.stream_recv(0, &mut out), Err(Error::Done));
     assert!(pipe.server.peer_error().is_none());
 }
-
 
 #[rstest]
 fn handshake_alpn_mismatch(
@@ -10645,6 +10647,395 @@ fn transport_close_by_client_during_handshake_established(
     );
 }
 
+fn track_manual_initial(conn: &mut Connection, len: usize) {
+    // encode_pkt bypasses recovery; these mixed packets contain valid frames
+    // that must be ACKed, so the test sender must remember their packet number.
+    let status = conn.handshake_status();
+    let now = Instant::now();
+    conn.on_packet_sent(
+        conn.paths.get_active_path_id().unwrap(),
+        test_utils::helper_packet_sent(conn.next_pkt_num - 1, now, len),
+        packet::Epoch::Initial,
+        true,
+        status,
+        now,
+    )
+    .unwrap();
+}
+
+#[rstest]
+fn initial_close_filter_is_opt_in_and_keeps_the_connection(
+    #[values(false, true)] enabled: bool, #[values(false, true)] to_server: bool,
+    #[values(false, true)] application: bool,
+    #[values(false, true)] resumed: bool,
+) {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_early_data();
+    config.set_ticket_key(&[0x5a; 48]).unwrap();
+    config.set_disable_initial_close(enabled);
+    let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
+    donor.handshake().unwrap();
+    let session = donor.client.session().unwrap().to_vec();
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    // The policy must already be frozen in each connection.
+    config.set_disable_initial_close(!enabled);
+    if resumed {
+        pipe.client.set_session(&session).unwrap();
+    }
+    let initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, initial).unwrap();
+    let mut buf = [0; 65535];
+    for code in [0, 0x0c, 0x1234] {
+        let close = if application {
+            frame::Frame::ApplicationClose {
+                error_code: code,
+                reason: b"untrusted reason".to_vec(),
+            }
+        } else {
+            frame::Frame::ConnectionClose {
+                error_code: code,
+                frame_type: 0x1234,
+                reason: b"untrusted reason".to_vec(),
+            }
+        };
+        let sender = if to_server {
+            &mut pipe.client
+        } else {
+            &mut pipe.server
+        };
+        let len = test_utils::encode_pkt(
+            sender,
+            Type::Initial,
+            &[
+                close,
+                frame::Frame::Ping { mtu_probe: None },
+                frame::Frame::Padding { len: 1200 },
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        let result = if to_server {
+            track_manual_initial(&mut pipe.client, len);
+            pipe.server_recv(&mut buf[..len])
+        } else {
+            track_manual_initial(&mut pipe.server, len);
+            pipe.client_recv(&mut buf[..len])
+        };
+        let receiver = if to_server {
+            &pipe.server
+        } else {
+            &pipe.client
+        };
+        if !enabled {
+            if application {
+                assert_eq!(result, Err(Error::InvalidPacket));
+                assert!(receiver.local_error().is_some());
+            } else {
+                assert_eq!(result, Ok(len));
+                assert!(receiver.is_draining());
+                assert_eq!(
+                    receiver.peer_error_packet_type(),
+                    Some(Type::Initial)
+                );
+            }
+            return;
+        }
+        assert_eq!(result, Ok(len));
+        assert!(receiver.peer_error().is_none());
+        assert!(receiver.peer_error_packet_type().is_none());
+        assert!(receiver.local_error().is_none());
+        assert!(!receiver.is_closed() && !receiver.is_draining());
+    }
+    pipe.advance().unwrap();
+    assert!(pipe.client.is_established() && pipe.server.is_established());
+    assert_eq!(pipe.client.is_resumed(), resumed);
+}
+
+#[rstest]
+fn initial_close_filter_preserves_crypto_and_coalesced_protected_close(
+    #[values(None, Some(Type::Handshake), Some(Type::Short))] close_type: Option<
+        Type,
+    >,
+) {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_disable_initial_close(true);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    let initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, initial).unwrap();
+    let mut buf = [0; 65535];
+    let (_, len) = pipe
+        .server
+        .send_single_for_type(
+            &mut buf,
+            0,
+            false,
+            Instant::now(),
+            Type::Initial,
+            false,
+        )
+        .unwrap();
+    let mut frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, frame::Frame::Crypto { .. })));
+    frames.insert(0, frame::Frame::ApplicationClose {
+        error_code: 42,
+        reason: b"forged".to_vec(),
+    });
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Initial,
+        &frames,
+        &mut buf,
+    )
+    .unwrap();
+    let mut datagram = buf[..len].to_vec();
+    track_manual_initial(&mut pipe.server, len);
+    if close_type != Some(Type::Handshake) {
+        for (pkt, _) in test_utils::emit_flight(&mut pipe.server).unwrap() {
+            datagram.extend(pkt);
+        }
+    }
+    if let Some(ty) = close_type {
+        let len = test_utils::encode_pkt(
+            &mut pipe.server,
+            ty,
+            &[frame::Frame::ConnectionClose {
+                error_code: 43,
+                frame_type: 0,
+                reason: b"protected".to_vec(),
+            }],
+            &mut buf,
+        )
+        .unwrap();
+        datagram.extend_from_slice(&buf[..len]);
+    }
+    assert_eq!(pipe.client_recv(&mut datagram), Ok(datagram.len()));
+    if let Some(ty) = close_type {
+        assert_eq!(pipe.client.peer_error_packet_type(), Some(ty));
+        assert_eq!(pipe.client.peer_error().unwrap().error_code, 43);
+        assert!(pipe.client.is_draining());
+    } else {
+        assert!(pipe.client.is_established());
+        assert!(pipe.client.peer_error().is_none());
+        pipe.advance().unwrap();
+        assert!(pipe.server.is_established());
+    }
+}
+
+#[rstest]
+fn initial_close_send_policy_preserves_local_failure(
+    #[values(false, true)] enabled: bool,
+) {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_disable_initial_close(enabled);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    let _ = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let mut buf = [0; 65535];
+    let len = test_utils::encode_pkt(
+        &mut pipe.client,
+        Type::Initial,
+        &[
+            frame::Frame::Ping { mtu_probe: None },
+            frame::Frame::Padding { len: 1200 },
+        ],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.server_recv(&mut buf[..len]).unwrap();
+    assert!(pipe.server.crypto_ctx[packet::Epoch::Handshake]
+        .crypto_seal
+        .is_none());
+    pipe.server.close(false, 42, b"local failure").unwrap();
+    assert_eq!(pipe.server.local_error().unwrap().error_code, 42);
+    assert_eq!(pipe.server.local_error().unwrap().reason, b"local failure");
+    if enabled {
+        assert!(pipe.server.is_closed());
+        assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
+    } else {
+        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        pipe.client_recv(&mut buf[..len]).unwrap();
+        assert_eq!(pipe.client.peer_error_packet_type(), Some(Type::Initial));
+    }
+}
+
+#[test]
+fn initial_close_send_policy_keeps_server_hello_before_protected_close() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_early_data();
+    config.set_ticket_key(&[0x5a; 48]).unwrap();
+    config.set_disable_initial_close(true);
+    let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
+    donor.handshake().unwrap();
+    let session = donor.client.session().unwrap().to_vec();
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    client.enable_early_data();
+    // Leave the client's filter disabled so an accidental Initial CLOSE fails.
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut config)
+            .unwrap();
+    pipe.client.set_session(&session).unwrap();
+    pipe.server.defer_early_data_handshake().unwrap();
+    let initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, initial).unwrap();
+    pipe.server.close(true, 42, b"secret").unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    assert!(!flight.is_empty());
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    assert!(!pipe.client.is_established());
+    assert_eq!(pipe.client.peer_error_packet_type(), Some(Type::Handshake));
+    assert_eq!(pipe.client.peer_error().unwrap().error_code, 0x0c);
+    assert!(pipe.client.peer_error().unwrap().reason.is_empty());
+}
+
+#[test]
+fn initial_close_policy_retains_tls_error_without_sending_initial_close() {
+    let mut client = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut server = test_utils::Pipe::default_config("cubic").unwrap();
+    client.set_application_protos(&[b"client-only"]).unwrap();
+    server.set_application_protos(&[b"server-only"]).unwrap();
+    server.set_disable_initial_close(true);
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    let initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert!(test_utils::process_flight(&mut pipe.server, initial).is_err());
+    assert!(pipe.server.local_error().is_some());
+    assert!(pipe.server.is_closed());
+    assert_eq!(test_utils::emit_flight(&mut pipe.server), Err(Error::Done));
+}
+
+#[rstest]
+fn initial_close_only_forgery_does_not_poison_retry_or_timers(
+    #[values(false, true)] resumed: bool,
+) {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_disable_initial_close(true);
+    config.enable_early_data();
+    let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
+    donor.handshake().unwrap();
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    if resumed {
+        pipe.client
+            .set_session(donor.client.session().unwrap())
+            .unwrap();
+    }
+    let mut initial = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let hdr = Header::from_slice(&mut initial[0].0, 16).unwrap();
+    let forged = Header {
+        ty: Type::Initial,
+        version: hdr.version,
+        dcid: hdr.scid.clone(),
+        scid: ConnectionId::from_ref(&[0xa5; 16]),
+        pkt_num: 1000,
+        pkt_num_len: 4,
+        token: None,
+        versions: None,
+        key_phase: false,
+    };
+    let old_idle = pipe.client.idle_timer;
+    let mut buf = [0; 4096];
+    for _ in 0..3 {
+        let len = test_utils::encode_initial_packet(
+            &forged,
+            &hdr.dcid,
+            true,
+            &[
+                frame::Frame::ApplicationClose {
+                    error_code: 42,
+                    reason: vec![],
+                },
+                frame::Frame::Padding { len: 1200 },
+            ],
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(pipe.client_recv(&mut buf[..len]), Ok(len));
+        assert_eq!(pipe.client.destination_id(), hdr.dcid);
+        assert_eq!(pipe.client.recv_count, 0);
+        assert_eq!(pipe.client.idle_timer, old_idle);
+        assert!(!pipe.client.is_closed() && !pipe.client.is_draining());
+        assert!(pipe.client.peer_error().is_none());
+    }
+    let retry_scid = ConnectionId::from_ref(&[0x5a; 16]);
+    let len = super::retry(
+        &hdr.scid,
+        &hdr.dcid,
+        &retry_scid,
+        b"token",
+        hdr.version,
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+    assert!(pipe.client.did_retry);
+    assert_eq!(pipe.client.destination_id(), retry_scid);
+    assert_eq!(pipe.client.is_in_early_data(), resumed);
+}
+
+#[rstest]
+fn initial_close_after_key_discard_preserves_coalesced_one_rtt(
+    #[values(false, true)] to_server: bool,
+) {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_disable_initial_close(true);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    let original_dcid = pipe.client.destination_id().into_owned();
+    pipe.handshake().unwrap();
+    let (sender, receiver) = if to_server {
+        (&mut pipe.client, &pipe.server)
+    } else {
+        (&mut pipe.server, &pipe.client)
+    };
+    assert!(receiver.crypto_ctx[packet::Epoch::Initial]
+        .crypto_open
+        .is_none());
+    let hdr = Header {
+        ty: Type::Initial,
+        version: PROTOCOL_VERSION,
+        dcid: receiver.source_id().into_owned(),
+        scid: sender.source_id().into_owned(),
+        pkt_num: 1000,
+        pkt_num_len: 4,
+        token: None,
+        versions: None,
+        key_phase: false,
+    };
+    let mut buf = [0; 4096];
+    let len = test_utils::encode_initial_packet(
+        &hdr,
+        &original_dcid,
+        !to_server,
+        &[
+            frame::Frame::ConnectionClose {
+                error_code: 42,
+                frame_type: 0,
+                reason: vec![],
+            },
+            frame::Frame::Padding { len: 1200 },
+        ],
+        &mut buf,
+    )
+    .unwrap();
+    let mut datagram = buf[..len].to_vec();
+    sender.close(true, 43, b"protected").unwrap();
+    let (len, _) = sender.send(&mut buf).unwrap();
+    datagram.extend_from_slice(&buf[..len]);
+    if to_server {
+        pipe.server_recv(&mut datagram).unwrap();
+    } else {
+        pipe.client_recv(&mut datagram).unwrap();
+    }
+    let receiver = if to_server {
+        &pipe.server
+    } else {
+        &pipe.client
+    };
+    assert_eq!(receiver.peer_error_packet_type(), Some(Type::Short));
+    assert_eq!(receiver.peer_error().unwrap().error_code, 43);
+}
+
 #[rstest]
 fn peer_error_packet_type_during_handshake(
     #[values(Type::Initial, Type::Handshake)] pkt_type: Type,
@@ -10702,6 +11093,7 @@ fn peer_error_packet_type_during_handshake(
 fn peer_error_packet_type_zero_rtt() {
     let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.enable_early_data();
+    config.set_disable_initial_close(true);
     config.set_ticket_key(&[0x5a; 48]).unwrap();
     let mut donor = test_utils::Pipe::with_config(&mut config).unwrap();
     donor.handshake().unwrap();

@@ -2042,36 +2042,53 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = socket.local_addr().unwrap();
         let mut incoming = crate::listen([socket], server_params, DefaultMetrics)
-            .unwrap().pop().unwrap();
+            .unwrap()
+            .pop()
+            .unwrap();
         let server = tokio::spawn(async move {
             while let Some(Ok(conn)) = incoming.next().await {
                 conn.start(TestApp::new(None, None));
             }
         });
         let mut params = ConnectionParams::new_client(
-            test_quic_settings(), None, Hooks::default(),
+            test_quic_settings(),
+            None,
+            Hooks::default(),
         );
         let (session_tx, session_rx) = oneshot::channel();
         let _donor = connect_test_client(
-            endpoint, &params, TestApp::new(Some(session_tx), None),
-        ).await.unwrap();
+            endpoint,
+            &params,
+            TestApp::new(Some(session_tx), None),
+        )
+        .await
+        .unwrap();
         params.session = time::timeout(Duration::from_secs(5), session_rx)
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert!(params.session.is_some());
         params.zero_rtt_streams = vec![ZeroRttStream {
             data: b"retained by the application".to_vec(),
             fin: false,
         }];
         assert!(!params.allow_early_data_fallback);
-        assert!(connect_test_client(endpoint, &params, TestApp::new(None, None))
-            .await.is_err());
+        assert!(
+            connect_test_client(endpoint, &params, TestApp::new(None, None))
+                .await
+                .is_err()
+        );
         params.allow_early_data_fallback = true;
         let (tx, rx) = oneshot::channel();
-        let _connection = connect_test_client(
-            endpoint, &params, TestApp::new(Some(tx), None),
-        ).await.unwrap();
+        let _connection =
+            connect_test_client(endpoint, &params, TestApp::new(Some(tx), None))
+                .await
+                .unwrap();
         assert!(time::timeout(Duration::from_secs(5), rx)
-            .await.unwrap().unwrap().is_some());
+            .await
+            .unwrap()
+            .unwrap()
+            .is_some());
         server.abort();
     }
 
