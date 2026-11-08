@@ -14484,6 +14484,70 @@ fn challenge_no_cids(
 }
 
 #[rstest]
+fn pmtud_respects_peer_udp_payload_limit(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    #[values(1200, 1240, 1432)] peer_limit: usize,
+    #[values(false, true)] smaller_server: bool,
+) {
+    let mut client = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    let mut server = test_utils::Pipe::default_config(cc_algorithm_name).unwrap();
+    let (client_limit, server_limit) = if smaller_server {
+        (1472, peer_limit)
+    } else {
+        (peer_limit, 1472)
+    };
+    for (config, recv_limit) in
+        [(&mut client, client_limit), (&mut server, server_limit)]
+    {
+        config.set_max_recv_udp_payload_size(recv_limit);
+        config.set_max_send_udp_payload_size(1472);
+        config.discover_pmtu(true);
+        config.enable_dgram(true, 8, 8);
+    }
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut client, &mut server)
+            .unwrap();
+    // Inspect every wire packet, including handshake and discovery flights.
+    for round in 0..2 {
+        let transfer = |sender: &mut Connection,
+                        receiver: &mut Connection,
+                        limit: usize| {
+            match test_utils::emit_flight(sender) {
+                Ok(flight) => {
+                    for (packet, _) in &flight {
+                        assert!(packet.len() <= limit,
+                                "round={round}: {}-byte packet exceeds peer limit {limit}", packet.len());
+                    }
+                    test_utils::process_flight(receiver, flight).unwrap();
+                },
+                Err(Error::Done) => (),
+                Err(error) => panic!("flight failed: {error:?}"),
+            }
+        };
+        for _ in 0..32 {
+            transfer(&mut pipe.client, &mut pipe.server, server_limit);
+            transfer(&mut pipe.server, &mut pipe.client, client_limit);
+            if pipe.client.pmtu() == Some(peer_limit) &&
+                pipe.server.pmtu() == Some(peer_limit)
+            {
+                break;
+            }
+        }
+        for connection in [&mut pipe.client, &mut pipe.server] {
+            assert!(connection.is_established());
+            assert_eq!(connection.pmtu(), Some(peer_limit));
+            assert!(connection.max_send_udp_payload_size() <= peer_limit);
+            let capacity = connection.dgram_max_writable_len().unwrap();
+            connection.dgram_send(&vec![0x5a; capacity]).unwrap();
+        }
+        if round == 0 {
+            pipe.client.revalidate_pmtu();
+            pipe.server.revalidate_pmtu();
+        }
+    }
+}
+
+#[rstest]
 fn pmtud_probe_success(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
 ) {

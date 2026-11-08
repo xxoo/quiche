@@ -84,6 +84,13 @@ impl Pmtud {
         Self::new(self.maximum_supported_mtu, self.max_probes)
     }
 
+    /// Narrows discovery to a peer's advertised receive limit.
+    pub(crate) fn limit_maximum_supported_mtu(&mut self, limit: usize) {
+        if limit < self.maximum_supported_mtu {
+            *self = Self::new(limit, self.max_probes);
+        }
+    }
+
     /// Indicates whether probing should continue on the connection.
     ///
     /// Checks there are no probes in flight, that a PMTU has not been
@@ -188,6 +195,11 @@ impl Pmtud {
 
     /// Records a failed probe
     pub fn failed_probe(&mut self, probe_size: usize) {
+        // A late loss report from before a receive-limit reduction must not
+        // restart a search above the new maximum.
+        if probe_size > self.maximum_supported_mtu {
+            return;
+        }
         // Treat errant probes as if they failed at the minimum supported MTU
         let probe_size = std::cmp::max(probe_size, MIN_PLPMTU);
         self.probe_failure_count += 1;
@@ -299,6 +311,26 @@ mod tests {
         assert_eq!(new_path.max_probes, 5);
         assert_eq!(new_path.get_current_mtu(), MIN_PLPMTU);
         assert!(new_path.should_probe());
+    }
+
+    #[test]
+    fn peer_limit_survives_late_loss_revalidation_and_new_paths() {
+        let mut pmtud = Pmtud::new(1472, 5);
+        pmtud.successful_probe(1472);
+        pmtud.limit_maximum_supported_mtu(1240);
+        assert_eq!(pmtud.get_current_mtu(), MIN_PLPMTU);
+        assert_eq!(pmtud.get_probe_size(), 1240);
+        assert_eq!(pmtud.max_probes, 5);
+        for _ in 0..5 {
+            pmtud.failed_probe(1472);
+        }
+        assert_eq!(pmtud.get_probe_size(), 1240);
+        pmtud.successful_probe(1240);
+        pmtud.limit_maximum_supported_mtu(1472);
+        assert_eq!(pmtud.get_pmtu(), Some(1240));
+        pmtud.revalidate_pmtu();
+        assert_eq!(pmtud.get_probe_size(), 1240);
+        assert_eq!(pmtud.for_new_path().get_probe_size(), 1240);
     }
 
     #[test]

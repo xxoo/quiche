@@ -7006,7 +7006,12 @@ impl<F: BufFactory> Connection<F> {
             if self.is_established() {
                 // Cap the packet size at 16,383 bytes so a two-byte varint can
                 // always encode it.
-                return cmp::min(16383, max_datagram_size);
+                return max_datagram_size.min(16383).min(
+                    self.peer_transport_params
+                        .max_udp_payload_size
+                        .try_into()
+                        .unwrap_or(usize::MAX),
+                );
             }
         }
 
@@ -8470,24 +8475,25 @@ impl<F: BufFactory> Connection<F> {
 
         active_path.recovery.update_max_ack_delay(max_ack_delay);
 
-        if active_path
-            .pmtud
-            .as_ref()
-            .map(|pmtud| pmtud.should_probe())
-            .unwrap_or(false)
-        {
-            active_path.recovery.pmtud_update_max_datagram_size(
-                active_path
-                    .pmtud
-                    .as_mut()
-                    .expect("PMTUD existence verified above")
-                    .get_probe_size()
-                    .min(peer_params.max_udp_payload_size as usize),
-            );
-        } else {
-            active_path.recovery.update_max_datagram_size(
-                peer_params.max_udp_payload_size as usize,
-            );
+        let peer_max_udp_payload_size = peer_params
+            .max_udp_payload_size
+            .try_into()
+            .unwrap_or(usize::MAX);
+        for (_, path) in self.paths.iter_mut() {
+            if let Some(pmtud) = path.pmtud.as_mut() {
+                // Bound the discovery state itself: send() and probe ACKs
+                // subsequently replace the recovery datagram limit.
+                pmtud.limit_maximum_supported_mtu(peer_max_udp_payload_size);
+                let size = if pmtud.should_probe() {
+                    pmtud.get_probe_size()
+                } else {
+                    pmtud.get_current_mtu()
+                };
+                path.recovery.pmtud_update_max_datagram_size(size);
+            } else {
+                path.recovery
+                    .update_max_datagram_size(peer_max_udp_payload_size);
+            }
         }
 
         // Record the max_active_conn_id parameter advertised by the peer.
@@ -8561,7 +8567,12 @@ impl<F: BufFactory> Connection<F> {
             if let Some((discover, max_probes)) = ex_data.pmtud {
                 self.paths.set_discover_pmtu_on_existing_paths(
                     discover,
-                    self.recovery_config.max_send_udp_payload_size,
+                    self.recovery_config.max_send_udp_payload_size.min(
+                        self.peer_transport_params
+                            .max_udp_payload_size
+                            .try_into()
+                            .unwrap_or(usize::MAX),
+                    ),
                     max_probes,
                 );
             }
