@@ -114,6 +114,8 @@ where
         with_gso: false,
         pacing_offload: false,
         with_pktinfo: false,
+        #[cfg(target_os = "linux")]
+        ingress: None,
         fixed_peer_ip: None,
         // Match the default `QuicSettings::pool_send_buffer` (pooling on).
         pool_send_buffer: true,

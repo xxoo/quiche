@@ -388,6 +388,9 @@ pub struct Incoming {
     /// If set, then `buf` is a GRO buffer containing multiple packets.
     /// Each individual packet has a size of `gso` (except for the last one).
     pub gro: Option<i32>,
+    /// Linux receive-interface index when server reply affinity is enabled.
+    #[cfg(target_os = "linux")]
+    pub ingress_ifindex: Option<std::num::NonZeroU32>,
     /// [SO_MARK] control message value received from the socket.
     ///
     /// This will always be `None` after the connection has been spawned as

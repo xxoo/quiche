@@ -252,6 +252,8 @@ pub struct WriterConfig {
     pub with_gso: bool,
     pub pacing_offload: bool,
     pub with_pktinfo: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) ingress: Option<Arc<crate::socket::ingress::ReplySockets>>,
     pub fixed_peer_ip: Option<std::net::IpAddr>,
     /// Whether the worker borrows its egress buffer from a per-worker-thread
     /// pool for each send burst. When `false`, the worker keeps a persistent
@@ -274,7 +276,17 @@ pub(crate) struct WriteState {
     // cycle.
     selected_path: Option<(SocketAddr, SocketAddr)>,
     // Iterator over the network paths that haven't been flushed yet.
-    pending_paths: quiche::SocketAddrIter,
+    pending_paths: Vec<(SocketAddr, SocketAddr)>,
+    #[cfg(target_os = "linux")]
+    ingress_paths: Vec<IngressPath>,
+}
+
+#[cfg(target_os = "linux")]
+struct IngressPath {
+    endpoints: (SocketAddr, SocketAddr),
+    ifindex: std::num::NonZeroU32,
+    socket: Arc<tokio::net::UdpSocket>,
+    unavailable: bool,
 }
 
 pub(crate) struct IoWorkerParams<Tx, M> {
@@ -586,7 +598,7 @@ where
         self.cfg.local_addr = local_addr;
         self.endpoint_state.set_local_addr(local_addr);
         self.write_state.selected_path = None;
-        self.write_state.pending_paths = quiche::SocketAddrIter::default();
+        self.write_state.pending_paths.clear();
         self.write_state.has_pending_data = true;
         qconn.revalidate_pmtu();
 
@@ -995,9 +1007,8 @@ where
     /// `pending_paths` iterator. If that is empty a new iterator will be
     /// created by querying quiche itself.
     ///
-    /// Note that the connection's statically configured local address will be
-    /// used to query quiche for available paths, so this can't handle multiple
-    /// local addresses currently.
+    /// A wildcard server can receive migration probes on a different local
+    /// address. A client has just one active UDP socket.
     fn select_path(
         &mut self, qconn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
@@ -1005,16 +1016,16 @@ where
             return self.write_state.selected_path;
         }
 
-        let from = self.cfg.local_addr;
-
-        // Initialize paths iterator.
-        if self.write_state.pending_paths.len() == 0 {
-            self.write_state.pending_paths = qconn.paths_iter(from);
+        if self.write_state.pending_paths.is_empty() {
+            let from = self.cfg.local_addr;
+            self.write_state.pending_paths.extend(
+                qconn
+                    .send_paths()
+                    .filter(|(local, _)| qconn.is_server() || *local == from),
+            );
+            self.write_state.pending_paths.reverse();
         }
-
-        let to = self.write_state.pending_paths.next()?;
-
-        Some((from, to))
+        self.write_state.pending_paths.pop()
     }
 
     #[cfg(not(feature = "gcongestion"))]
@@ -1073,7 +1084,8 @@ where
                 //
                 // Otherwise the write loop will start again and the next path
                 // will be selected.
-                let has_pending_paths = self.write_state.pending_paths.len() > 0;
+                let has_pending_paths =
+                    !self.write_state.pending_paths.is_empty();
 
                 // Keep writing if there are paths left to try.
                 self.write_state.has_pending_data = has_pending_paths;
@@ -1107,7 +1119,26 @@ where
             let (from, to) = self.write_state.selected_path.unzip();
 
             let to = to.unwrap_or(self.cfg.peer_addr);
-            let from = from.filter(|_| self.cfg.with_pktinfo);
+            #[cfg(target_os = "linux")]
+            let ingress_slot = if self.cfg.ingress.is_some() {
+                let Some(slot) =
+                    self.write_state.ingress_paths.iter().position(|path| {
+                        Some(path.endpoints) == self.write_state.selected_path
+                    })
+                else {
+                    self.metrics.write_errors(labels::QuicWriteError::Err).inc();
+                    return;
+                };
+                Some(slot)
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let pinned = ingress_slot
+                .map(|i| self.write_state.ingress_paths[i].socket.as_ref());
+            #[cfg(not(target_os = "linux"))]
+            let pinned: Option<&tokio::net::UdpSocket> = None;
+            let from = from.filter(|_| pinned.is_some() || self.cfg.with_pktinfo);
 
             let dscp = self.dscp_handle.as_ref().and_then(DscpHandle::get);
             // Don't bypass the socket wrapper when DSCP cannot be applied.
@@ -1116,8 +1147,8 @@ where
                     dscp.is_some();
 
             let send_res = if let (Some(udp_socket), true) = (
-                self.socket.as_udp_socket(),
-                self.cfg.with_gso || needs_dscp_cmsg,
+                pinned.or_else(|| self.socket.as_udp_socket()),
+                pinned.is_some() || self.cfg.with_gso || needs_dscp_cmsg,
             ) {
                 // Only UDP supports GSO and per-packet DSCP control messages.
                 let (segment_size, tx_time) = if self.cfg.with_gso {
@@ -1148,6 +1179,18 @@ where
             #[cfg(feature = "perf-quic-listener-metrics")]
             self.measure_complete_handshake_time();
 
+            #[cfg(target_os = "linux")]
+            if let Some(i) = ingress_slot {
+                let path = &mut self.write_state.ingress_paths[i];
+                if let Err(error) = &send_res {
+                    if !path.unavailable {
+                        log::warn!("QUIC ingress reply path unavailable";
+                            "ifindex" => path.ifindex.get(), "local" => path.endpoints.0,
+                            "peer" => path.endpoints.1, "error" => error);
+                    }
+                }
+                path.unavailable = send_res.is_err();
+            }
             match send_res {
                 Ok(n) =>
                     if n < self.write_state.bytes_written {
@@ -1193,6 +1236,55 @@ where
     ) -> QuicResult<bool> {
         // Check every packet so a busy peer cannot bypass the deadline.
         self.enforce_handshake_deadline(qconn)?;
+        #[cfg(target_os = "linux")]
+        if let Some(pool) = self.cfg.ingress.as_ref() {
+            let path = (pkt.local_addr, pkt.peer_addr);
+            let Some(index) = pkt.ingress_ifindex else {
+                return Ok(false);
+            };
+            if let Some(existing) = self
+                .write_state
+                .ingress_paths
+                .iter()
+                .find(|p| p.endpoints == path)
+            {
+                // An unverified packet (or a delayed packet on another NIC)
+                // may not redirect this path, even if it carries a known CID.
+                if existing.ifindex != index {
+                    return Ok(false);
+                }
+            } else {
+                let accepted = recv_incoming(self.cfg.fixed_peer_ip, qconn, pkt)?;
+                if accepted && qconn.is_path_validated(path.0, path.1).is_ok() {
+                    self.write_state.ingress_paths.retain(|p| {
+                        qconn
+                            .is_path_validated(p.endpoints.0, p.endpoints.1)
+                            .is_ok()
+                    });
+                    let socket = match pool.writer(path.0, index) {
+                        Ok(socket) => socket,
+                        Err(error)
+                            if self.write_state.ingress_paths.is_empty() =>
+                            return Err(error.into()),
+                        Err(error) => {
+                            // A candidate cannot take down an established path.
+                            self.metrics
+                                .write_errors(labels::QuicWriteError::Err)
+                                .inc();
+                            log::warn!("Cannot probe QUIC ingress reply path"; "error" => error);
+                            return Ok(accepted);
+                        },
+                    };
+                    self.write_state.ingress_paths.push(IngressPath {
+                        endpoints: path,
+                        ifindex: index,
+                        socket,
+                        unavailable: false,
+                    });
+                }
+                return Ok(accepted);
+            }
+        }
         recv_incoming(self.cfg.fixed_peer_ip, qconn, pkt)
     }
 
@@ -1720,6 +1812,8 @@ mod tests {
                 with_gso: false,
                 pacing_offload: false,
                 with_pktinfo: false,
+                #[cfg(target_os = "linux")]
+                ingress: None,
                 fixed_peer_ip: None,
                 pool_send_buffer: true,
             },
@@ -1797,6 +1891,8 @@ mod tests {
             gro,
             #[cfg(target_os = "linux")]
             so_mark_data: None,
+            #[cfg(target_os = "linux")]
+            ingress_ifindex: None,
         }
     }
 

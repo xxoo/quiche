@@ -118,6 +118,8 @@ struct PollRecvData {
     buf: Vec<u8>,
     // The packet's source, e.g., the peer's address
     src_addr: SocketAddr,
+    #[cfg(target_os = "linux")]
+    ingress_ifindex: Option<std::num::NonZeroU32>,
     // The packet's original destination. If the original destination is
     // different from the local listening address, this will be `None`.
     dst_addr_override: Option<SocketAddr>,
@@ -251,6 +253,8 @@ where
                     u16, // drop count
                     sockaddr_in, // IP_RECVORIGDSTADDR
                     sockaddr_in6, // IPV6_RECVORIGDSTADDR
+                    libc::in_pktinfo,
+                    libc::in6_pktinfo,
                     u32 // SO_MARK
                 ),
 
@@ -429,6 +433,8 @@ where
                 .map_or(self.config.pacing_offload, |config| {
                     config.pacing_offload
                 }),
+            #[cfg(target_os = "linux")]
+            ingress: self.config.ingress.clone(),
             with_pktinfo: if self.local_addr.is_ipv4() {
                 self.config.has_ippktinfo
             } else {
@@ -549,6 +555,8 @@ where
             dst_addr_override: None,
             #[cfg(target_os = "linux")]
             so_mark_data: None,
+            #[cfg(target_os = "linux")]
+            ingress_ifindex: None,
         }))
     }
 
@@ -620,6 +628,7 @@ where
 
                         let mut rx_time = None;
                         let mut gro = None;
+                        let mut ingress = None;
                         let mut dst_addr_override = None;
                         let mut mark_bytes: Option<[u8; 4]> = None;
 
@@ -632,6 +641,7 @@ where
                                 rx_time,
                                 gro,
                                 so_mark_data: mark_bytes,
+                                ingress_ifindex: None,
                             }));
                         };
 
@@ -701,12 +711,34 @@ where
                                         &parsed_addr,
                                     );
                                 },
-                                ControlMessageOwned::Ipv4PacketInfo(_) |
-                                ControlMessageOwned::Ipv6PacketInfo(_) => {
-                                    // We only want the destination address from
-                                    // IP_RECVORIGDSTADDR, but we'll get these
-                                    // messages because we set IP_PKTINFO on the
-                                    // socket.
+                                ControlMessageOwned::Ipv4PacketInfo(v) =>
+                                    if let Ok(index) =
+                                        u32::try_from(v.ipi_ifindex)
+                                    {
+                                        if index != 0 {
+                                            ingress = Some((
+                                                index,
+                                                std::net::IpAddr::V4(
+                                                    std::net::Ipv4Addr::from(
+                                                        v.ipi_addr
+                                                            .s_addr
+                                                            .to_ne_bytes(),
+                                                    ),
+                                                ),
+                                            ));
+                                        }
+                                    },
+                                ControlMessageOwned::Ipv6PacketInfo(v) => {
+                                    if v.ipi6_ifindex != 0 {
+                                        ingress = Some((
+                                            v.ipi6_ifindex,
+                                            std::net::IpAddr::V6(
+                                                std::net::Ipv6Addr::from(
+                                                    v.ipi6_addr.s6_addr,
+                                                ),
+                                            ),
+                                        ));
+                                    }
                                 },
                                 ControlMessageOwned::Unknown(raw_cmsg) => {
                                     let UnknownCmsg {
@@ -736,7 +768,30 @@ where
                             };
                         }
 
+                        let ingress_ifindex = if self.config.ingress.is_some() {
+                            ingress.and_then(|(index, ip)| {
+                                // Normalize mapped peers to IPv4 so path keys
+                                // and actual send socket address families
+                                // agree.
+                                let ip = ip.to_canonical();
+                                if ip.is_unspecified() || ip.is_multicast() {
+                                    return None;
+                                }
+                                let mut dst =
+                                    SocketAddr::new(ip, self.local_addr.port());
+                                if let SocketAddr::V6(v6) = &mut dst {
+                                    if v6.ip().is_unicast_link_local() {
+                                        v6.set_scope_id(index);
+                                    }
+                                }
+                                dst_addr_override = Some(dst);
+                                std::num::NonZeroU32::new(index)
+                            })
+                        } else {
+                            None
+                        };
                         return Poll::Ready(Ok(PollRecvData {
+                            ingress_ifindex,
                             buf: filled_buf,
                             src_addr: peer_addr,
                             dst_addr_override,
@@ -778,7 +833,24 @@ where
             gro,
             #[cfg(target_os = "linux")]
             so_mark_data,
+            #[cfg(target_os = "linux")]
+            ingress_ifindex,
         } = pkt_data;
+        #[cfg(target_os = "linux")]
+        let peer_addr = if self.config.ingress.is_some() {
+            if ingress_ifindex.is_none() {
+                log::debug!("Discarding QUIC datagram without a unicast ingress path";
+                    "local" => self.local_addr);
+                return Poll::Ready(());
+            }
+            match peer_addr {
+                SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() =>
+                    SocketAddr::new(peer_addr.ip().to_canonical(), v6.port()),
+                _ => peer_addr,
+            }
+        } else {
+            peer_addr
+        };
 
         let local_addr = self
             .endpoint_state
@@ -800,6 +872,8 @@ where
             gro,
             #[cfg(target_os = "linux")]
             so_mark_data,
+            #[cfg(target_os = "linux")]
+            ingress_ifindex,
         });
 
         // Only error handling below - if `on_incoming` was successful,
@@ -1354,6 +1428,8 @@ mod tests {
                 connection_hook: None,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             },
             Arc::clone(&socket),
             Default::default(),
@@ -1378,6 +1454,8 @@ mod tests {
                 gro: None,
                 #[cfg(target_os = "linux")]
                 so_mark_data: None,
+                #[cfg(target_os = "linux")]
+                ingress_ifindex: None,
             })
             .unwrap();
         let initial = accepted.try_recv().unwrap().unwrap();
@@ -1424,6 +1502,8 @@ mod tests {
                 connection_hook: None,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             },
             Arc::clone(&socket_tx),
             Default::default(),
@@ -1497,6 +1577,8 @@ mod tests {
                 connection_hook: None,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             },
             Arc::clone(&socket),
             Default::default(),
@@ -1520,6 +1602,8 @@ mod tests {
                 gro: None,
                 #[cfg(target_os = "linux")]
                 so_mark_data: None,
+                #[cfg(target_os = "linux")]
+                ingress_ifindex: None,
             })
             .unwrap();
         let initial = accepted.try_recv().unwrap().unwrap();
@@ -1575,6 +1659,8 @@ mod tests {
                 enable_per_connection_dscp: params.enable_per_connection_dscp,
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             },
             Arc::clone(&socket_tx),
             Default::default(),
@@ -1640,7 +1726,6 @@ mod tests {
     async fn check_worker_dscp_across_handshake(bind_addr: &str) {
         use crate::quic::io::gso::test::enable_tos;
         use crate::quic::io::gso::test::recv_tos;
-        use futures::StreamExt;
         use nix::sys::socket::setsockopt;
         use nix::sys::socket::sockopt;
 

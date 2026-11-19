@@ -60,6 +60,9 @@ pub(crate) struct Config {
     pub keylog_file: Option<File>,
     pub listen_backlog: usize,
     pub handshake_timeout: Option<Duration>,
+    #[cfg(target_os = "linux")]
+    pub(crate) ingress:
+        Option<std::sync::Arc<crate::socket::ingress::ReplySockets>>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
     pub(crate) server_config_identity: ServerConfigIdentity,
@@ -113,6 +116,8 @@ impl Config {
             keylog_file,
             listen_backlog: quic_settings.listen_backlog,
             handshake_timeout: quic_settings.handshake_timeout,
+            #[cfg(target_os = "linux")]
+            ingress: None,
             has_ippktinfo,
             has_ipv6pktinfo,
             server_config_identity: params.server_config_identity(),
@@ -324,6 +329,7 @@ fn apply_transport_settings(
     );
     config.set_stateless_reset_token(quic_settings.stateless_reset_token);
     config.set_disable_dcid_reuse(quic_settings.disable_dcid_reuse);
+    config.set_validate_before_migration(quic_settings.reply_on_ingress);
 
     if let Some(track_unknown_transport_params) =
         quic_settings.track_unknown_transport_parameters

@@ -13322,6 +13322,82 @@ fn send_on_path_test(
     assert_eq!(stats.path_challenge_rx_count, 3);
 }
 
+#[test]
+fn ingress_reply_validates_rebinding_before_switch_and_ignores_late_data() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_validate_before_migration(true);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+    let original = test_utils::Pipe::client_addr();
+    let server = test_utils::Pipe::server_addr();
+    let rebound = SocketAddr::new(original.ip(), original.port() + 1);
+
+    pipe.client.stream_send(0, b"a", false).unwrap();
+    let delayed = test_utils::emit_flight(&mut pipe.client).unwrap();
+    pipe.client.stream_send(0, b"b", false).unwrap();
+    let mut first = test_utils::emit_flight(&mut pipe.client).unwrap();
+    for (_, info) in &mut first {
+        info.from = rebound;
+    }
+    test_utils::process_flight(&mut pipe.server, first).unwrap();
+    assert_eq!(
+        pipe.server.paths.get_active().unwrap().peer_addr(),
+        original
+    );
+    assert_eq!(pipe.server.is_path_validated(server, rebound), Ok(false));
+    assert!(pipe.server.send_paths().any(|p| p == (server, rebound)));
+
+    // The NAT translates the destination back to the client's original
+    // socket and translates its response to the new external port.
+    for _ in 0..4 {
+        let mut probes = test_utils::emit_flight_on_path(
+            &mut pipe.server,
+            Some(server),
+            Some(rebound),
+        )
+        .unwrap();
+        for (_, info) in &mut probes {
+            info.to = original;
+        }
+        test_utils::process_flight(&mut pipe.client, probes).unwrap();
+        let mut response = test_utils::emit_flight(&mut pipe.client).unwrap();
+        for (_, info) in &mut response {
+            info.from = rebound;
+        }
+        test_utils::process_flight(&mut pipe.server, response).unwrap();
+        if pipe.server.is_path_validated(server, rebound) == Ok(true) {
+            break;
+        }
+    }
+    assert_eq!(pipe.server.is_path_validated(server, rebound), Ok(true));
+    assert_eq!(pipe.server.paths.get_active().unwrap().peer_addr(), rebound);
+    test_utils::process_flight(&mut pipe.server, delayed).unwrap();
+    assert_eq!(pipe.server.paths.get_active().unwrap().peer_addr(), rebound);
+}
+
+#[test]
+fn ingress_reply_probes_a_different_local_address_before_migrating() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_validate_before_migration(true);
+    config.set_active_connection_id_limit(3);
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 2);
+    let local = "127.0.0.2:443".parse().unwrap();
+    let peer = "127.0.0.3:4567".parse().unwrap();
+    pipe.client.migrate(peer, local).unwrap();
+    pipe.client.stream_send(0, b"new", true).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    assert_eq!(
+        pipe.server.paths.get_active().unwrap().local_addr(),
+        test_utils::Pipe::server_addr()
+    );
+    assert!(pipe.server.send_paths().any(|p| p == (local, peer)));
+    pipe.advance().unwrap();
+    assert_eq!(pipe.server.is_path_validated(local, peer), Ok(true));
+    let active = pipe.server.paths.get_active().unwrap();
+    assert_eq!((active.local_addr(), active.peer_addr()), (local, peer));
+}
+
 #[rstest]
 fn connection_migration(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,

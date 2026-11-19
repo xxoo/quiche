@@ -610,6 +610,7 @@ pub struct Config {
     max_amplification_factor: usize,
 
     disable_dcid_reuse: bool,
+    validate_before_migration: bool,
 
     disable_initial_close: bool,
 
@@ -708,6 +709,7 @@ impl Config {
             max_amplification_factor: MAX_AMPLIFICATION_FACTOR,
 
             disable_dcid_reuse: false,
+            validate_before_migration: false,
 
             disable_initial_close: false,
 
@@ -1133,6 +1135,12 @@ impl Config {
             self.local_transport_params.active_conn_id_limit =
                 cmp::min(v, octets::MAX_VAR_INT);
         }
+    }
+
+    /// Wait for path validation before moving server application traffic to a
+    /// newly observed peer path. The initial handshake is unaffected.
+    pub fn set_validate_before_migration(&mut self, value: bool) {
+        self.validate_before_migration = value;
     }
 
     /// Sets the `disable_active_migration` transport parameter.
@@ -1653,6 +1661,8 @@ where
     /// Whether the connection should prevent from reusing destination
     /// Connection IDs when the peer migrates.
     disable_dcid_reuse: bool,
+    validate_before_migration: bool,
+    pending_peer_migration: Option<(SocketAddr, SocketAddr)>,
 
     /// The number of streams reset by local.
     reset_stream_local_count: u64,
@@ -2315,6 +2325,8 @@ impl<F: BufFactory> Connection<F> {
             emit_dgram: true,
 
             disable_dcid_reuse: config.disable_dcid_reuse,
+            validate_before_migration: config.validate_before_migration,
+            pending_peer_migration: None,
 
             reset_stream_local_count: 0,
             stopped_stream_local_count: 0,
@@ -3919,14 +3931,54 @@ impl<F: BufFactory> Connection<F> {
                 pn,
             );
 
-            // Did the peer migrated to another path?
+            // Only the newest non-probing packet can request a migration.
             let active_path_id = self.paths.get_active_path_id()?;
 
             if self.is_server &&
-                recv_pid != active_path_id &&
                 self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num == pn
             {
-                self.on_peer_migrated(recv_pid, self.disable_dcid_reuse, now)?;
+                if recv_pid == active_path_id {
+                    self.pending_peer_migration = None;
+                } else if self.validate_before_migration &&
+                    !self.paths.get(recv_pid)?.validated()
+                {
+                    self.pending_peer_migration = Some((info.to, info.from));
+                } else {
+                    self.pending_peer_migration = None;
+                    self.on_peer_migrated(
+                        recv_pid,
+                        self.disable_dcid_reuse,
+                        now,
+                    )?;
+                }
+            }
+        }
+
+        if self.validate_before_migration && self.is_server {
+            // A NAT can rebind before a spare DCID is available. Probe using
+            // the current DCID only when the local address and the CID used by
+            // the peer are unchanged (RFC 9000 section 9.5).
+            let recv = self.paths.get(recv_pid)?;
+            if !self.disable_dcid_reuse && recv.active_dcid_seq.is_none() {
+                let active = self.paths.get_active()?;
+                if recv.local_addr() == active.local_addr() &&
+                    recv.active_scid_seq == active.active_scid_seq
+                {
+                    self.paths.get_mut(recv_pid)?.active_dcid_seq =
+                        active.active_dcid_seq;
+                }
+            }
+            // Validation frames and a newer migration request can arrive in
+            // the same packet. Commit only after processing both.
+            if let Some(addrs) = self.pending_peer_migration {
+                match self.paths.path_id_from_addrs(&addrs) {
+                    Some(pid) if self.paths.get(pid)?.validated() => {
+                        self.pending_peer_migration = None;
+                        self.on_peer_migrated(pid, self.disable_dcid_reuse, now)?;
+                    },
+                    None => self.pending_peer_migration = None,
+                    _ => (),
+                }
             }
         }
 
@@ -7853,16 +7905,27 @@ impl<F: BufFactory> Connection<F> {
         // given 4-tuple, simply filter paths that cannot be used.
         SocketAddrIter {
             sockaddrs: self
-                .paths
-                .iter()
-                .filter(|(_, p)| p.active_dcid_seq.is_some())
-                .filter(|(_, p)| p.usable() || p.probing_required())
-                .filter(|(_, p)| p.local_addr() == from)
-                .map(|(_, p)| p.peer_addr())
+                .send_paths()
+                .filter(|(local, _)| *local == from)
+                .map(|(_, peer)| peer)
                 .collect(),
 
             index: 0,
         }
+    }
+
+    /// Iterates over sendable (local, peer) pairs, including candidate paths
+    /// which currently need a probe. Does not constrain the local address.
+    pub fn send_paths(
+        &self,
+    ) -> impl Iterator<Item = (SocketAddr, SocketAddr)> + '_ {
+        self.paths
+            .iter()
+            .filter(|(_, p)| {
+                p.active_dcid_seq.is_some() &&
+                    (p.usable() || p.probing_required())
+            })
+            .map(|(_, p)| (p.local_addr(), p.peer_addr()))
     }
 
     /// Closes the connection with the given error and reason.

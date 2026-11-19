@@ -73,6 +73,8 @@ pub(crate) struct ConnectionAcceptorConfig {
     pub(crate) enable_per_connection_dscp: bool,
     #[cfg(target_os = "linux")]
     pub(crate) with_pktinfo: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) ingress: Option<Arc<crate::socket::ingress::ReplySockets>>,
 }
 
 impl ConnectionAcceptorConfig {
@@ -210,11 +212,26 @@ where
         let written = writer(&mut send_buf)?;
         let socket = Arc::clone(&self.socket);
         #[cfg(target_os = "linux")]
-        let with_pktinfo = self.config.with_pktinfo;
+        let with_pktinfo =
+            self.config.with_pktinfo || self.config.ingress.is_some();
+        #[cfg(target_os = "linux")]
+        let writer = self
+            .config
+            .ingress
+            .as_ref()
+            .map(|pool| {
+                let index = incoming.ingress_ifindex.ok_or_else(|| {
+                    io::Error::other("QUIC reply missing ingress interface")
+                })?;
+                pool.writer(incoming.local_addr, index)
+            })
+            .transpose()?;
         #[cfg(target_os = "linux")]
         let would_block_metric = self
             .metrics
             .write_errors(labels::QuicWriteError::WouldBlock);
+        #[cfg(target_os = "linux")]
+        let write_errors = self.metrics.write_errors(labels::QuicWriteError::Err);
         #[cfg(target_os = "linux")]
         let send_to_wouldblock_duration_s =
             self.metrics.send_to_wouldblock_duration_s();
@@ -232,18 +249,25 @@ where
             #[cfg(target_os = "linux")]
             {
                 let from = with_pktinfo.then_some(incoming.local_addr);
-                let _ = crate::quic::io::gso::send_to(
-                    udp,
+                if let Err(error) = crate::quic::io::gso::send_to(
+                    writer.as_deref().unwrap_or(udp),
                     to,
                     from,
                     send_buf,
-                    Some(send_buf.len()),
+                    None,
                     None,
                     None,
                     would_block_metric,
                     send_to_wouldblock_duration_s,
                 )
-                .await;
+                .await
+                {
+                    write_errors.inc();
+                    if let Some(index) = incoming.ingress_ifindex {
+                        foundations::telemetry::log::debug!("QUIC stateless ingress reply failed";
+                            "ifindex" => index.get(), "local" => incoming.local_addr, "error" => error);
+                    }
+                }
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -471,6 +495,8 @@ mod tests {
             connection_hook: Some(hook.clone()),
             #[cfg(target_os = "linux")]
             with_pktinfo: false,
+            #[cfg(target_os = "linux")]
+            ingress: None,
         };
         let peer_addr = "[::ffff:192.0.2.1]:443".parse().unwrap();
 
@@ -584,6 +610,8 @@ mod tests {
                 gro: None,
                 #[cfg(target_os = "linux")]
                 so_mark_data: None,
+                #[cfg(target_os = "linux")]
+                ingress_ifindex: None,
             },
             header,
         )
@@ -640,6 +668,8 @@ mod tests {
                 connection_hook: Some(hook.clone()),
                 #[cfg(target_os = "linux")]
                 with_pktinfo: false,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             },
             sender.clone(),
             AddrValidationTokenManager::default(),
@@ -918,6 +948,8 @@ mod dscp_tests {
                 connection_hook: None,
                 enable_per_connection_dscp: dscp != 0,
                 with_pktinfo: true,
+                #[cfg(target_os = "linux")]
+                ingress: None,
             },
             Arc::clone(&sender),
             Default::default(),
@@ -932,6 +964,8 @@ mod dscp_tests {
             buf: Vec::new(),
             gro: None,
             so_mark_data: None,
+            #[cfg(target_os = "linux")]
+            ingress_ifindex: None,
         };
         acceptor
             .handshake_reply(incoming, |buf| {

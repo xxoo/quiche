@@ -216,6 +216,8 @@ mod tests {
             gro: None,
             #[cfg(target_os = "linux")]
             so_mark_data: None,
+            #[cfg(target_os = "linux")]
+            ingress_ifindex: None,
         }
     }
 

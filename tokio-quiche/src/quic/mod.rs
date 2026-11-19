@@ -560,7 +560,24 @@ where
         "O_NONBLOCK should be set for the listening socket"
     );
 
-    let config = Config::new(params, socket.capabilities).into_io()?;
+    #[cfg_attr(not(target_os = "linux"), expect(unused_mut))]
+    let mut config = Config::new(params, socket.capabilities).into_io()?;
+    if params.settings.reply_on_ingress {
+        #[cfg(target_os = "linux")]
+        {
+            config.ingress =
+                Some(Arc::new(crate::socket::ingress::ReplySockets::prepare(
+                    &socket.socket,
+                    config.has_gso,
+                    config.pacing_offload,
+                )?));
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "QUIC ingress replies require Linux",
+        ));
+    }
 
     let local_addr = socket.socket.local_addr()?;
     let socket_tx = Arc::new(socket.socket);
@@ -570,6 +587,8 @@ where
         ConnectionAcceptorConfig {
             connection_hook: params.hooks.connection_hook.clone(),
             enable_per_connection_dscp: params.enable_per_connection_dscp,
+            #[cfg(target_os = "linux")]
+            ingress: config.ingress.clone(),
             #[cfg(target_os = "linux")]
             with_pktinfo: if local_addr.is_ipv4() {
                 config.has_ippktinfo

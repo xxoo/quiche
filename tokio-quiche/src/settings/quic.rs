@@ -77,6 +77,11 @@ pub struct QuicSettings {
     /// extension defaults to false and is fixed at connection creation.
     pub disable_initial_close: bool,
 
+    /// Pin server replies to the local interface on which each QUIC path
+    /// arrived. Linux listeners only. Disabled by default.
+    #[serde(default)]
+    pub reply_on_ingress: bool,
+
     /// Sets the `initial_max_data` transport parameter.
     ///
     /// Defaults to 10 MB.

@@ -125,5 +125,6 @@ tempfile = "3"
 tokio = { workspace = true, features = ["time", "test-util", "rt-multi-thread"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }
 libc = { workspace = true }
 nix = { workspace = true, features = ["signal"] }

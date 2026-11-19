@@ -28,6 +28,8 @@
 
 mod capabilities;
 mod connected;
+#[cfg(target_os = "linux")]
+pub(crate) mod ingress;
 mod listener;
 mod migratable;
 
